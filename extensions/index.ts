@@ -512,6 +512,10 @@ export default function (pi: ExtensionAPI) {
         let voiceIdx = voices.length > 0 ? Math.max(0, voices.indexOf(effective.voice)) : -1;
         let speedIdx = speedToIndex(effective.speed);
         let dtypeIdx = Math.max(0, DTYPES.indexOf(defaults.dtype));
+        // The dtype loaded on the server when the modal opened. We only fire a
+        // (potentially huge) download/activate on close, and only if the final
+        // selection differs — scrubbing left/right must NOT load models.
+        const initialActiveDtype = health?.activeDtype ?? null;
         let selectedRow = 0;
         let playing = false;
         let playError: string | null = null;
@@ -563,7 +567,8 @@ export default function (pi: ExtensionAPI) {
               } else if (row.id === "speed") {
                 lines.push(`${cursor} Speed  ${left}${SPEED_VALUES[speedIdx]}${right}`);
               } else if (row.id === "model") {
-                lines.push(`${cursor} Model  ${left}${DTYPES[dtypeIdx]}${right} ${theme.fg("dim", "(dtype)")}`);
+                const tag = DTYPES[dtypeIdx] === initialActiveDtype ? "active" : "loads on close";
+                lines.push(`${cursor} Model  ${left}${DTYPES[dtypeIdx]}${right} ${theme.fg("dim", `(${tag})`)}`);
               }
             }
 
@@ -579,6 +584,15 @@ export default function (pi: ExtensionAPI) {
           handleInput(data: string) {
             if (matchesKey(data, "escape")) {
               persistSession();
+              // Apply the model choice on close — one load, only if it changed.
+              const chosen = DTYPES[dtypeIdx];
+              if (chosen !== initialActiveDtype) {
+                void fetch(`${serverUrl()}/models/download`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ dtype: chosen, activate: true }),
+                }).catch(() => {});
+              }
               done(undefined);
               return;
             }
@@ -633,15 +647,13 @@ export default function (pi: ExtensionAPI) {
                 speedIdx = (speedIdx + dir + SPEED_VALUES.length) % SPEED_VALUES.length;
                 session.speed = Number.parseFloat(SPEED_VALUES[speedIdx]);
               } else if (rowId === "model") {
+                // Selection only — do NOT load/download here. Applied on close.
                 dtypeIdx = (dtypeIdx + dir + DTYPES.length) % DTYPES.length;
                 defaults = { ...defaults, dtype: DTYPES[dtypeIdx] };
-                feedback = `Switching model to ${DTYPES[dtypeIdx]}… (enter to sample)`;
-                // Activate the chosen dtype on the server (downloads if needed).
-                void fetch(`${serverUrl()}/models/download`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ dtype: DTYPES[dtypeIdx], activate: true }),
-                }).catch(() => {});
+                feedback =
+                  DTYPES[dtypeIdx] === initialActiveDtype
+                    ? `Model ${DTYPES[dtypeIdx]} (active)`
+                    : `Model ${DTYPES[dtypeIdx]} — loads on close`;
               }
               persistSession();
               emitConfig();
