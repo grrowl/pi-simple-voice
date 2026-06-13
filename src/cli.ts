@@ -1,18 +1,18 @@
 #!/usr/bin/env -S node --import jiti
 
 /**
- * pi-voice CLI — Manage the Kokoro TTS server and models.
+ * pi-simple-voice CLI — Manage the Kokoro TTS server and models.
  *
  * Usage:
- *   pi-voice server status              Show server status
- *   pi-voice server start               Start server, load default model
- *   pi-voice server stop                Stop server, unload model
- *   pi-voice server restart             Restart server
- *   pi-voice model list                 List available models
- *   pi-voice model load <name>          Load a model (downloads if needed)
- *   pi-voice model unload               Unload current model
- *   pi-voice model download <name>      Download model without loading
- *   pi-voice model remove <name>        Unload and remove model files
+ *   pi-simple-voice server status              Show server status
+ *   pi-simple-voice server start               Start server, load default model
+ *   pi-simple-voice server stop                Stop server, unload model
+ *   pi-simple-voice server restart             Restart server
+ *   pi-simple-voice model list                 List available models
+ *   pi-simple-voice model load <name>          Load a model (downloads if needed)
+ *   pi-simple-voice model unload               Unload current model
+ *   pi-simple-voice model download <name>      Download model without loading
+ *   pi-simple-voice model remove <name>        Unload and remove model files
  *
  * Options:
  *   --host <host>   Override server host (default: 127.0.0.1)
@@ -210,7 +210,7 @@ async function requireServer(args: string[]): Promise<{ host: string; port: numb
   const { host, port } = resolveHostPort(args);
   const health = await fetchHealth(host, port);
   if (!health) {
-    console.error("Server is not running. Start it with: pi-voice server start");
+    console.error("Server is not running. Start it with: pi-simple-voice server start");
     process.exit(1);
   }
   return { host, port };
@@ -219,7 +219,7 @@ async function requireServer(args: string[]): Promise<{ host: string; port: numb
 /** Validate dtype argument. */
 function requireDtype(value: string | undefined, command: string): DType {
   if (!value) {
-    console.error(`Usage: pi-voice model ${command} <model-name>`);
+    console.error(`Usage: pi-simple-voice model ${command} <model-name>`);
     process.exit(1);
   }
   if (!DTYPES.includes(value as DType)) {
@@ -262,7 +262,7 @@ async function cmdServerStart(args: string[]) {
   const pid = readPid();
   if (pid && isProcessRunning(pid)) {
     console.error(`Process ${pid} is alive but not responding on http://${host}:${port}.`);
-    console.error("Try 'pi-voice server stop' then 'pi-voice server start'.");
+    console.error("Try 'pi-simple-voice server stop' then 'pi-simple-voice server start'.");
     process.exit(1);
   }
   removePid();
@@ -348,7 +348,7 @@ async function cmdModelList(args: string[]) {
   const models = await fetchModels(host, port);
 
   if (!models) {
-    console.error("Server is not running. Start it with: pi-voice server start");
+    console.error("Server is not running. Start it with: pi-simple-voice server start");
     process.exit(1);
   }
 
@@ -444,18 +444,18 @@ async function cmdModelRemove(args: string[]) {
 // ── Main ───────────────────────────────────────────────────────────
 
 function printUsage() {
-  console.log(`pi-voice \u2014 Kokoro TTS server management
+  console.log(`pi-simple-voice \u2014 Kokoro TTS server management
 
 Usage:
-  pi-voice server status              Show server status
-  pi-voice server start               Start server, load default model
-  pi-voice server stop                Stop server, unload model
-  pi-voice server restart             Restart server
-  pi-voice model list                 List available models
-  pi-voice model load <name>          Load a model (downloads if needed)
-  pi-voice model unload               Unload current model
-  pi-voice model download <name>      Download model without loading
-  pi-voice model remove <name>        Unload and remove model files
+  pi-simple-voice server status              Show server status
+  pi-simple-voice server start               Start server, load default model
+  pi-simple-voice server stop                Stop server, unload model
+  pi-simple-voice server restart             Restart server
+  pi-simple-voice model list                 List available models
+  pi-simple-voice model load <name>          Load a model (downloads if needed)
+  pi-simple-voice model unload               Unload current model
+  pi-simple-voice model download <name>      Download model without loading
+  pi-simple-voice model remove <name>        Unload and remove model files
 
 Options:
   --host <host>   Override server host (default: 127.0.0.1)
@@ -488,7 +488,7 @@ async function main() {
       case "restart":
         return await cmdServerRestart(rest);
       default:
-        console.error(`Unknown command: pi-voice server ${command ?? ""}`);
+        console.error(`Unknown command: pi-simple-voice server ${command ?? ""}`);
         console.error("Available: status, start, stop, restart");
         process.exit(1);
     }
@@ -507,7 +507,7 @@ async function main() {
       case "remove":
         return await cmdModelRemove(rest);
       default:
-        console.error(`Unknown command: pi-voice model ${command ?? ""}`);
+        console.error(`Unknown command: pi-simple-voice model ${command ?? ""}`);
         console.error("Available: list, load, unload, download, remove");
         process.exit(1);
     }

@@ -1,15 +1,15 @@
 /**
- * Kokoro TTS Server — local fork of @s1m0n38/pi-voice's server.
+ * Kokoro TTS Server — pi-simple-voice (forked from @s1m0n38/pi-voice's server).
  *
- * Forked into the secretary repo so we own it (no @mariozechner/* coupling —
- * this file imports zero pi APIs, only node builtins + kokoro-js). Run as a
- * standalone bun subprocess spawned by the `voice` extension.
+ * Imports zero pi APIs — only node builtins + kokoro-js — so it runs standalone.
+ * The extension (index.ts) spawns it on demand and shares it across pi sessions;
+ * one model lives in memory at a time.
  *
  * Changes vs upstream:
- *   - Idle-unload: the model is disposed after IDLE_MS of no /tts, freeing
- *     ~88–300 MB while the (tiny) HTTP server stays up. The model transparently
- *     reloads on the next /tts (reload-on-demand), so one model lives in RAM at
- *     most and multiple pis share this single server.
+ *   - Idle self-exit: after IDLE_MS with no /tts the whole process exits (the
+ *     surest way to actually reclaim ONNX memory). The extension re-spawns it on
+ *     the next request, so an idle session costs nothing.
+ *   - Serialized model ops + self-heal of corrupt cache files.
  *
  * Endpoints:
  *   GET  /health             → { status, activeDtype, lastDtype, modelLoaded, loading }
@@ -23,7 +23,7 @@
  *   POST /shutdown           → { status: "shutting down" }
  *
  * Usage:
- *   bun server.ts [--port 8181] [--host 127.0.0.1] [--idle-ms 300000]
+ *   bun server.ts [--port 8181] [--host 127.0.0.1] [--idle-ms 900000]
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";

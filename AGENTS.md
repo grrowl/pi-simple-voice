@@ -1,116 +1,88 @@
-# pi-voice — Agent Context
+# pi-simple-voice — Agent Context
+
+Streaming, verbatim Kokoro TTS for the Pi agent. A fork of
+[s1m0n38/pi-voice](https://github.com/s1m0n38/pi-voice) that speaks the
+assistant's output as it streams — no summarization, no agent-facing tool.
 
 ## Quick Reference
 
 | What | Command |
 |------|---------|
+| Unit tests | `bun test extensions/` |
+| Lint | `npm run lint` (biome) |
 | Type check | `npm run typecheck` |
-| Lint | `npm run lint` |
-| Server tests | `npm test` (~50s, real kokoro-js q4) |
-| E2E tests | `npm run test:e2e` (needs running server + pilotty) |
-| Start server | `npm run server` |
-| Verify before commit | `npm run typecheck && npm run lint` |
+| Run server standalone | `npm run server` (or `bun extensions/server.ts`) |
+| Run CLI | `bun src/cli.ts` |
 
 ## Constraints
 
-- **No build step** — pi loads `.ts` via jiti
-- **2-space indent** — enforced by biome
-- **Single model in memory** — every model-swap path calls `unloadModel()` first, which disposes ONNX sessions
-- **Peer deps use `*` range** — pi packages list `@mariozechner/pi-*` and `typebox` as `peerDependencies: "*"`
+- **No build step** — pi loads `.ts` directly (bun/jiti). Never add a compile step.
+- **2-space indent** — enforced by biome.
+- **Single model in memory** — every model-swap path unloads/disposes the
+  previous ONNX session first. Model ops are serialized in the server.
+- **Runtime is `@earendil-works/*`** — the extension imports `@earendil-works/pi-coding-agent`
+  and `@earendil-works/pi-tui`; these are `peerDependencies`.
+- **The server spawns under `bun`** — `bun` must be on `PATH` at runtime.
 
 ## Project Layout
 
 ```
 extensions/
-  index.ts             # Extension: /voice command, tts tool, auto-TTS events
-  server.ts            # HTTP server: Kokoro ONNX TTS model lifecycle + REST API
-  server.test.ts       # Server integration tests (node:test, 28 tests)
+  index.ts             # Extension: streaming verbatim speech, /voice TUI, server lifecycle
+  chunking.ts          # Pure helpers: reasoning filter, markdown clean, sentence chunking
+  chunking.test.ts     # Unit tests for the above (node:test, run via `bun test`)
+  server.ts            # HTTP server: Kokoro ONNX model lifecycle + REST API
 src/
-  cli.ts               # CLI: pi-voice server/model management
-tests/
-  helpers.sh           # Shared pilotty test utilities
-  run.sh               # E2E test runner (tui, tts-tool, auto-tts)
-  tui.sh               # /voice TUI interaction tests
-  tts-tool.sh          # tts tool invocation tests
-  auto-tts.sh          # Auto-TTS event handler tests
-.agents/skills/        # pi-test, pi-init, pi-package skills
+  cli.ts               # CLI: pi-simple-voice server/model management
+  prepare.js           # npm prepare hook (writes default ~/.pi/voice/config.json)
+.agents/skills/        # pi-init, pi-package authoring skills
 ```
-
----
 
 ## Architecture
 
+### Extension (`extensions/index.ts`)
+
+- Speaks the assistant's output **verbatim and streaming**: accumulates
+  `message_update` text, drains complete clauses/sentences (`drainBoundaries`),
+  and enqueues them for synthesis. The first chunk flushes fast (low
+  time-to-first-audio); later chunks wait for sentence ends.
+- **Never voices reasoning** — `getContent` drops thinking/reasoning parts.
+- Interrupts on `turn_start` / `abort` (NOT `agent_end` — that cut off the final
+  sentence in upstream).
+- `/voice` TUI: enable, voice, speed, model dtype (loads lazily on close). The
+  `♪` status bar shows live download/load progress. Toggle with `alt+v`.
+- **No agent-facing tool** — speech is a side-effect of output, not callable.
+- Spawns the server on demand and points it at `~/.pi/voice`.
+
 ### Server (`extensions/server.ts`)
 
-HTTP server managing the Kokoro ONNX TTS model lifecycle. Binds to `127.0.0.1:8181` by default.
-
-**Endpoints:**
+Standalone HTTP server (node:http, zero pi APIs) managing the Kokoro model.
+Binds `127.0.0.1:8181` by default. **Self-exits after `--idle-ms` (default 15
+min)** of no `/tts`; the extension re-spawns it on demand.
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Server status, active dtype, model loaded |
-| GET | `/voices` | Available voice names (model must be loaded) |
-| GET | `/models` | All dtypes with download status |
-| POST | `/models/download` | Download + auto-activate a dtype |
-| POST | `/models/delete` | Delete cached files (unloads if active) |
-| POST | `/models/activate` | Load a downloaded model |
-| POST | `/models/unload` | Unload model, free memory |
-| POST | `/tts` | Synthesize text → WAV audio |
-| POST | `/shutdown` | Graceful shutdown |
+| GET | `/health` | status, activeDtype, lastDtype, modelLoaded, loading, progress |
+| GET | `/voices` | available voice names |
+| GET | `/models` | all dtypes with download status |
+| POST | `/models/download` | download (+ optionally activate) a dtype |
+| POST | `/models/delete` | delete cached files (unloads if active) |
+| POST | `/models/activate` | load a downloaded model |
+| POST | `/models/unload` | unload, free memory |
+| POST | `/tts` | synthesize text → WAV |
+| POST | `/shutdown` | graceful shutdown |
 
-**Model lifecycle** — `loadModel()` → `unloadModel()` → `downloadModel()` all enforce the single-model invariant. Config persisted at `~/.pi/voice/manifest.json`.
-
-### Extension (`extensions/index.ts`)
-
-- `/voice` command — custom TUI (↑↓ navigate, ←→ cycle values, Enter test, r reset, Esc close)
-- `tts` tool — LLM-initiated speech synthesis
-- Auto-TTS — listens to `agent_end` events, speaks the last response
-- Settings: on/off toggle, voice selector, speed (0.5–3.0)
-- Persistence: `~/.pi/voice/config.json` for defaults, session overrides via `pi.appendEntry()`
-
----
+Config + cache live under `~/.pi/voice/` (`config.json`, `cache/`).
 
 ## Testing
 
-### Server Integration Tests
+`extensions/chunking.test.ts` unit-tests the pure streaming logic (the heart of
+the fork) with no runtime deps. Run with `bun test extensions/`. The helpers are
+isolated in `chunking.ts` precisely so they're testable without the pi stack.
 
-`extensions/server.test.ts` uses `node:test` with the real kokoro-js q4 model. Spawns one server process for the entire suite.
-
-```
-Validation (11) → Download (3) → Voices (1) → TTS (5) → Unload (2) → Activate (2) → Lifecycle (4)
-```
-
-### E2E Tests (`tests/`)
-
-Pilotty-based PTY automation testing the full extension stack. Requires a running server with a loaded model and a working pi installation.
-
-```bash
-npm run server                # start server in one terminal
-npm run test:e2e              # run all E2E tests in another
-npm run test:tui              # run individual suites
-```
-
----
+A server/e2e harness against real kokoro-js is not yet ported from upstream.
 
 ## Git Conventions
 
-- **Conventional commits** — `feat:`, `fix:`, `docs:`, `chore:`, `ci:`, `refactor:`
-- **Rebase merges only** — `gh pr merge <number> --rebase`
-- **Release flow** — push to main → release-please opens Release PR → merge → auto publish
-
----
-
-## Common Pitfalls
-
-- **Memory leaks** — Always `unloadModel()` (→ `tts.model.dispose()`) before loading a new model. Never null without disposing.
-- **No build step** — pi loads `.ts` via jiti. Never add a compile step.
-- **Runtime deps go in `dependencies`** — not `devDependencies`.
-- **`kokoro-js` has no download-only mode** — `from_pretrained()` always loads into memory, so `downloadModel()` must unload first.
-
----
-
-## Pi Package Docs
-
-When implementing extension features, read the official docs:
-- Extensions: `~/.local/share/npm/lib/node_modules/@mariozechner/pi-coding-agent/docs/extensions.md`
-- Skills: `…/docs/skills.md` · Themes: `…/docs/themes.md` · Packages: `…/docs/packages.md`
+- Conventional commits (`feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `test:`).
+- This is a fork: keep attribution to upstream intact in README/CHANGELOG.
