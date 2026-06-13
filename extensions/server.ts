@@ -130,11 +130,27 @@ let activeDtype: DType | null = null;
 // transparently reload after the model has been freed.
 let lastDtype: DType | null = null;
 let loading = false;
+// Download/load progress for the active model op, surfaced via /health so the
+// extension can show "♪ ↓ fp32 25%" on the status bar. null when idle.
+let progress: { dtype: DType; phase: "download" | "load"; percent: number } | null = null;
 
 async function importKokoro() {
   if (KokoroTTS) return;
   const mod = await import("kokoro-js");
   KokoroTTS = mod.KokoroTTS;
+}
+
+// Build a transformers progress_callback bound to a dtype + phase.
+function makeProgressCb(dtype: DType, phase: "download" | "load") {
+  // biome-ignore lint/suspicious/noExplicitAny: ProgressInfo is a union
+  return (info: any) => {
+    const status = info?.status;
+    if (status === "progress") {
+      progress = { dtype, phase, percent: Math.round(info.progress ?? 0) };
+    } else if (status === "initiate" || status === "download") {
+      progress = { dtype, phase, percent: 0 };
+    }
+  };
 }
 
 // ── Idle-unload ────────────────────────────────────────────────────
@@ -195,6 +211,7 @@ async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
   }
 
   loading = true;
+  progress = { dtype, phase: "load", percent: 0 };
   try {
     await unloadModel();
 
@@ -206,6 +223,7 @@ async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
     tts = await KokoroTTS.from_pretrained(MODEL_ID, {
       dtype,
       device: "cpu",
+      progress_callback: makeProgressCb(dtype, "load"),
     });
     activeDtype = dtype;
     lastDtype = dtype;
@@ -214,6 +232,7 @@ async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
     return tts;
   } finally {
     loading = false;
+    progress = null;
   }
 }
 
@@ -221,32 +240,45 @@ async function downloadModel(dtype: DType): Promise<void> {
   await importKokoro();
 
   console.log(`[voice-server] Downloading model: ${MODEL_ID} (dtype=${dtype}) ...`);
-  const { env } = await import("@huggingface/transformers");
-  env.cacheDir = CACHE_DIR;
-  const instance = await KokoroTTS.from_pretrained(MODEL_ID, {
-    dtype,
-    device: "cpu",
-  });
-  console.log(`[voice-server] Download complete (${dtype}).`);
-  markDownloaded(dtype);
+  progress = { dtype, phase: "download", percent: 0 };
+  try {
+    const { env } = await import("@huggingface/transformers");
+    env.cacheDir = CACHE_DIR;
+    const instance = await KokoroTTS.from_pretrained(MODEL_ID, {
+      dtype,
+      device: "cpu",
+      progress_callback: makeProgressCb(dtype, "download"),
+    });
+    console.log(`[voice-server] Download complete (${dtype}).`);
+    markDownloaded(dtype);
 
-  await unloadModel();
-  tts = instance;
-  activeDtype = dtype;
-  lastDtype = dtype;
-  console.log(`[voice-server] Auto-activated ${dtype}.`);
+    await unloadModel();
+    tts = instance;
+    activeDtype = dtype;
+    lastDtype = dtype;
+    console.log(`[voice-server] Auto-activated ${dtype}.`);
+  } finally {
+    progress = null;
+  }
 }
 
 async function downloadOnlyModel(dtype: DType): Promise<void> {
   await importKokoro();
 
   console.log(`[voice-server] Downloading model (no activate): ${MODEL_ID} (dtype=${dtype}) ...`);
-  const { env } = await import("@huggingface/transformers");
-  env.cacheDir = CACHE_DIR;
-  const instance = await KokoroTTS.from_pretrained(MODEL_ID, {
-    dtype,
-    device: "cpu",
-  });
+  progress = { dtype, phase: "download", percent: 0 };
+  let instance: import("kokoro-js").KokoroTTS;
+  try {
+    const { env } = await import("@huggingface/transformers");
+    env.cacheDir = CACHE_DIR;
+    instance = await KokoroTTS.from_pretrained(MODEL_ID, {
+      dtype,
+      device: "cpu",
+      progress_callback: makeProgressCb(dtype, "download"),
+    });
+  } finally {
+    progress = null;
+  }
   console.log(`[voice-server] Download complete (${dtype}). Disposing temporary instance...`);
   markDownloaded(dtype);
 
@@ -294,6 +326,7 @@ function handleHealth(_req: IncomingMessage, res: ServerResponse) {
     lastDtype,
     modelLoaded: tts !== null,
     loading,
+    progress,
   });
 }
 
