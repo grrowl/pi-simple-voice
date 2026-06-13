@@ -210,6 +210,14 @@ export default function (pi: ExtensionAPI) {
   let defaults = loadConfig();
   let session: VoiceSessionState = {};
   let currentCtx: ExtensionContext | undefined;
+  let progressTimer: ReturnType<typeof setInterval> | undefined;
+
+  interface Health {
+    modelLoaded: boolean;
+    activeDtype: string | null;
+    loading: boolean;
+    progress: { dtype: string; phase: "download" | "load"; percent: number } | null;
+  }
 
   function getEffective(): FullVoiceConfig {
     return {
@@ -434,11 +442,11 @@ export default function (pi: ExtensionAPI) {
     return resolve(agentDir, "voice-server", "server.ts");
   }
 
-  async function fetchHealth(): Promise<{ modelLoaded: boolean; activeDtype: string | null; loading: boolean } | null> {
+  async function fetchHealth(): Promise<Health | null> {
     try {
       const res = await fetch(`${serverUrl()}/health`, { signal: AbortSignal.timeout(1500) });
       if (!res.ok) return null;
-      return (await res.json()) as { modelLoaded: boolean; activeDtype: string | null; loading: boolean };
+      return (await res.json()) as Health;
     } catch {
       return null;
     }
@@ -486,6 +494,7 @@ export default function (pi: ExtensionAPI) {
     }
     // Ensure the model is downloaded + active (idempotent on the server).
     if (!health.modelLoaded && !health.loading) {
+      startProgressPolling();
       try {
         await fetch(`${serverUrl()}/models/download`, {
           method: "POST",
@@ -587,6 +596,7 @@ export default function (pi: ExtensionAPI) {
               // Apply the model choice on close — one load, only if it changed.
               const chosen = DTYPES[dtypeIdx];
               if (chosen !== initialActiveDtype) {
+                startProgressPolling();
                 void fetch(`${serverUrl()}/models/download`, {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
@@ -716,10 +726,38 @@ export default function (pi: ExtensionAPI) {
 
   function updateStatusBar() {
     if (!currentCtx) return;
+    if (progressTimer) return; // poller owns the status bar during a download/load
     const effective = getEffective();
     const theme = currentCtx.ui.theme;
     const icon = effective.enabled ? theme.fg("success", "♪") : theme.fg("dim", "♪");
     currentCtx.ui.setStatus("voice", icon);
+  }
+
+  // While the server is downloading/loading a model, show progress on the
+  // status bar (e.g. "♪ ↓ fp32 25%"). Self-stops when the op finishes.
+  function startProgressPolling() {
+    if (progressTimer) return;
+    progressTimer = setInterval(async () => {
+      const h = await fetchHealth();
+      if (!currentCtx) return;
+      const theme = currentCtx.ui.theme;
+      if (h?.progress) {
+        const { phase, dtype, percent } = h.progress;
+        const label = phase === "download" ? `↓ ${dtype} ${percent}%` : `loading ${dtype}…`;
+        currentCtx.ui.setStatus("voice", theme.fg("warning", `♪ ${label}`));
+      } else if (h?.loading) {
+        currentCtx.ui.setStatus("voice", theme.fg("warning", "♪ loading…"));
+      } else {
+        stopProgressPolling();
+      }
+    }, 600);
+  }
+
+  function stopProgressPolling() {
+    if (!progressTimer) return;
+    clearInterval(progressTimer);
+    progressTimer = undefined;
+    updateStatusBar();
   }
 
   // ── Session lifecycle ───────────────────────────────────────────
