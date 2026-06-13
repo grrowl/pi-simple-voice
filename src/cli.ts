@@ -6,7 +6,7 @@
  * Usage:
  *   pi-simple-voice server status              Show server status
  *   pi-simple-voice server start               Start server, load default model
- *   pi-simple-voice server stop                Stop server, unload model
+ *   pi-simple-voice server stop                Stop server (exits the process)
  *   pi-simple-voice server restart             Restart server
  *   pi-simple-voice model list                 List available models
  *   pi-simple-voice model load <name>          Load a model (downloads if needed)
@@ -44,7 +44,10 @@ type DType = (typeof DTYPES)[number];
 interface VoiceConfig {
   host?: string;
   port?: number;
-  defaultModel?: string;
+  // The model dtype the extension reads/writes in ~/.pi/voice/config.json.
+  // Keep this key in sync with the extension's config so `server start` loads
+  // the same default the user picked via /voice.
+  dtype?: string;
   enabled?: boolean;
   voice?: string;
   speed?: number;
@@ -53,7 +56,7 @@ interface VoiceConfig {
 const DEFAULT_CONFIG: VoiceConfig = {
   host: "127.0.0.1",
   port: 8181,
-  defaultModel: "q4",
+  dtype: "q4",
 };
 
 function loadConfig(): VoiceConfig {
@@ -286,7 +289,7 @@ async function cmdServerStart(args: string[]) {
 
       // Load default model
       const config = loadConfig();
-      const model = config.defaultModel ?? "q4";
+      const model = config.dtype ?? "q4";
       console.log(`Loading default model (${model}) ...`);
       const result = await postJson(host, port, "/models/download", {
         dtype: model,
@@ -449,7 +452,7 @@ function printUsage() {
 Usage:
   pi-simple-voice server status              Show server status
   pi-simple-voice server start               Start server, load default model
-  pi-simple-voice server stop                Stop server, unload model
+  pi-simple-voice server stop                Stop server (exits the process)
   pi-simple-voice server restart             Restart server
   pi-simple-voice model list                 List available models
   pi-simple-voice model load <name>          Load a model (downloads if needed)
