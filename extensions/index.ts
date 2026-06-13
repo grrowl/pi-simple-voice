@@ -372,10 +372,10 @@ export default function (pi: ExtensionAPI) {
     firstFlushDone = false;
   });
 
-  // Interrupt on a new user turn or an explicit abort. (NOT agent_end — that
-  // fires right after message_end and would cut off the final sentence.)
+  // Interrupt on a new user turn. (NOT agent_end — that fires right after
+  // message_end and would cut off the final sentence.) There is no `abort`
+  // extension event in the pi SDK, so a new turn is the interrupt signal.
   pi.on("turn_start", () => stopSpeech());
-  pi.on("abort", () => stopSpeech());
 
   // ── Server lifecycle (persistent + idle-unload) ───────────────────
 
