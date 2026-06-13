@@ -1,42 +1,24 @@
 name: Release
 
+# release-please maintains the CHANGELOG, version bump, release PR, and the
+# GitHub release + tag — all via the default GITHUB_TOKEN (no secrets needed).
+# Publishing to npm is done manually/locally (`npm publish`); there is no CI
+# publish job and no NPM_TOKEN.
+
 on:
   push:
     branches: [main]
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
-      - uses: googleapis/release-please-action@v4
-        id: release
+      - uses: googleapis/release-please-action@8b8fd2cc23b2e18957157a9d923d75aa0c6f6ad5 # v4
         with:
           release-type: node
-
-  publish:
-    needs: release
-    if: ${{ needs.release.outputs.release_created }}
-    runs-on: ubuntu-latest
-    environment: publish
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-
-      - run: rm -f package-lock.json && npm install
-
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
