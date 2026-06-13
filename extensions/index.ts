@@ -28,12 +28,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import {
-  cleanTextForSpeech,
-  drainBoundaries,
-  getContent,
-  trimChunk,
-} from "./chunking.ts";
+import { cleanTextForSpeech, drainBoundaries, getContent, trimChunk } from "./chunking.ts";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -70,7 +65,19 @@ export interface VoiceEventMap {
 const CONFIG_DIR = resolve(homedir(), ".pi", "voice");
 const CONFIG_PATH = resolve(CONFIG_DIR, "config.json");
 const DTYPES = ["q4", "q4f16", "q8", "fp16", "fp32"];
-const SPEED_VALUES = ["0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0", "2.25", "2.5", "2.75", "3.0"];
+const SPEED_VALUES = [
+  "0.5",
+  "0.75",
+  "1.0",
+  "1.25",
+  "1.5",
+  "1.75",
+  "2.0",
+  "2.25",
+  "2.5",
+  "2.75",
+  "3.0",
+];
 
 const DEFAULT_CONFIG: FullVoiceConfig = {
   enabled: true,
@@ -89,8 +96,15 @@ function speedToIndex(speed: number): number {
 
 function voiceHint(name: string): string {
   const langMap: Record<string, string> = {
-    a: "American", b: "British", j: "Japanese", z: "Mandarin",
-    e: "Spanish", f: "French", h: "Hindi", i: "Italian", p: "Brazilian",
+    a: "American",
+    b: "British",
+    j: "Japanese",
+    z: "Mandarin",
+    e: "Spanish",
+    f: "French",
+    h: "Hindi",
+    i: "Italian",
+    p: "Brazilian",
   };
   const genderMap: Record<string, string> = { f: "female", m: "male" };
   const lang = langMap[name[0]] ?? "";
@@ -224,7 +238,11 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function synthAndPlay(text: string, config: FullVoiceConfig, signal: AbortSignal): Promise<void> {
+  async function synthAndPlay(
+    text: string,
+    config: FullVoiceConfig,
+    signal: AbortSignal,
+  ): Promise<void> {
     const spoken = cleanTextForSpeech(text);
     if (!spoken) return;
 
@@ -304,7 +322,9 @@ export default function (pi: ExtensionAPI) {
     writeFileSync(file, wav);
     await new Promise<void>((resolvePlay, rejectPlay) => {
       const cmd = process.platform === "darwin" ? "afplay" : "aplay";
-      execCb(`${cmd} "${file}"`, { timeout: 30_000 }, (err) => (err ? rejectPlay(err) : resolvePlay()));
+      execCb(`${cmd} "${file}"`, { timeout: 30_000 }, (err) =>
+        err ? rejectPlay(err) : resolvePlay(),
+      );
     });
   }
 
@@ -411,7 +431,11 @@ export default function (pi: ExtensionAPI) {
       const res = await fetch(`${serverUrl()}/models`, { signal: AbortSignal.timeout(2000) });
       if (!res.ok) return new Set();
       const data = (await res.json()) as { models: Record<string, { downloaded: boolean }> };
-      return new Set(Object.entries(data.models).filter(([, v]) => v.downloaded).map(([k]) => k));
+      return new Set(
+        Object.entries(data.models)
+          .filter(([, v]) => v.downloaded)
+          .map(([k]) => k),
+      );
     } catch {
       return new Set();
     }
@@ -534,12 +558,15 @@ export default function (pi: ExtensionAPI) {
                 lines.push(`${cursor} TTS    ${left}${enabled ? "on" : "off"}${right}`);
               } else if (row.id === "voice") {
                 const val = voices[voiceIdx] ?? "";
-                lines.push(`${cursor} Voice  ${left}${val}${right} ${theme.fg("dim", `(${voiceHint(val)})`)}`);
+                lines.push(
+                  `${cursor} Voice  ${left}${val}${right} ${theme.fg("dim", `(${voiceHint(val)})`)}`,
+                );
               } else if (row.id === "speed") {
                 lines.push(`${cursor} Speed  ${left}${SPEED_VALUES[speedIdx]}${right}`);
               } else if (row.id === "model") {
                 const d = DTYPES[dtypeIdx];
-                const tag = d === liveActive ? "active" : downloaded.has(d) ? "downloaded" : "not downloaded";
+                const tag =
+                  d === liveActive ? "active" : downloaded.has(d) ? "downloaded" : "not downloaded";
                 lines.push(`${cursor} Model  ${left}${d}${right} ${theme.fg("dim", `(${tag})`)}`);
               }
             }
@@ -549,7 +576,12 @@ export default function (pi: ExtensionAPI) {
             else if (playError) lines.push(`  ${theme.fg("error", `✗ ${playError}`)}`);
             else if (feedback) lines.push(`  ${theme.fg("success", feedback)}`);
 
-            lines.push(theme.fg("dim", " ↑↓ navigate • ←→ change • enter sample • s save default • r reset • esc close"));
+            lines.push(
+              theme.fg(
+                "dim",
+                " ↑↓ navigate • ←→ change • enter sample • s save default • r reset • esc close",
+              ),
+            );
             return lines;
           },
           invalidate() {},
@@ -576,7 +608,13 @@ export default function (pi: ExtensionAPI) {
 
             if (matchesKey(data, "s")) {
               const voice = voices.length > 0 ? voices[voiceIdx] : defaults.voice;
-              defaults = { ...defaults, enabled, voice, speed: Number.parseFloat(SPEED_VALUES[speedIdx]), dtype: DTYPES[dtypeIdx] };
+              defaults = {
+                ...defaults,
+                enabled,
+                voice,
+                speed: Number.parseFloat(SPEED_VALUES[speedIdx]),
+                dtype: DTYPES[dtypeIdx],
+              };
               saveConfig(defaults);
               feedback = "✓ Saved as default";
               tui.requestRender();
@@ -644,7 +682,11 @@ export default function (pi: ExtensionAPI) {
               playError = null;
               tui.requestRender();
               const voice = voices.length > 0 ? voices[voiceIdx] : defaults.voice;
-              playSample(sampleText, { ...getEffective(), voice, speed: Number.parseFloat(SPEED_VALUES[speedIdx]) })
+              playSample(sampleText, {
+                ...getEffective(),
+                voice,
+                speed: Number.parseFloat(SPEED_VALUES[speedIdx]),
+              })
                 .then(() => {
                   playing = false;
                   tui.requestRender();
@@ -661,7 +703,6 @@ export default function (pi: ExtensionAPI) {
       });
     },
   });
-
 
   // ── Status bar ──────────────────────────────────────────────────
 
@@ -708,7 +749,8 @@ export default function (pi: ExtensionAPI) {
     restoreSession(ctx);
     updateStatusBar();
     // Only spin up the (heavy) Kokoro server if TTS is actually enabled.
-    if (getEffective().enabled) void ensureServer().catch((err) => console.warn("[voice] ensureServer:", err));
+    if (getEffective().enabled)
+      void ensureServer().catch((err) => console.warn("[voice] ensureServer:", err));
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -731,7 +773,11 @@ export default function (pi: ExtensionAPI) {
       else stopSpeech();
       persistSession();
       ctx.ui.notify(`TTS ${next ? "enabled" : "disabled"}`, "info");
-      pi.events.emit("voice:config", { enabled: next, voice: effective.voice, speed: effective.speed });
+      pi.events.emit("voice:config", {
+        enabled: next,
+        voice: effective.voice,
+        speed: effective.speed,
+      });
     },
   });
 }

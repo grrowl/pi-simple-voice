@@ -15,14 +15,16 @@ export function getContent(message: any): string {
   const content = message?.content;
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    return content
-      // biome-ignore lint/suspicious/noExplicitAny: content parts have varying shapes
-      .map((part: any) => {
-        if (!part || typeof part.text !== "string") return "";
-        const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
-        return type.includes("thinking") || type.includes("reasoning") ? "" : part.text;
-      })
-      .join("");
+    return (
+      content
+        // biome-ignore lint/suspicious/noExplicitAny: content parts have varying shapes
+        .map((part: any) => {
+          if (!part || typeof part.text !== "string") return "";
+          const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
+          return type.includes("thinking") || type.includes("reasoning") ? "" : part.text;
+        })
+        .join("")
+    );
   }
   return "";
 }
@@ -36,7 +38,7 @@ export function cleanTextForSpeech(text: string): string {
   return text
     .replace(/```[\s\S]*?```/g, "")
     .replace(/`([^`]+)`/g, "$1")
-    .replace(/[*_~>#\[\]()]/g, "")
+    .replace(/[*_~>#[\]()]/g, "")
     .replace(/\s+/g, " ")
     .trim();
 }
