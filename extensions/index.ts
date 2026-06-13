@@ -1,64 +1,34 @@
 /**
- * pi-voice extension — /voice command and tts tool.
+ * voice — local, simplified fork of @s1m0n38/pi-voice's extension.
  *
- * TUI settings (via /voice):
- *   - TTS enabled/disabled (toggle)
- *   - Voice selector (fetched from server when model is loaded)
- *   - Speed selector (0.5 – 3.0)
+ * Ported from @mariozechner/* to @earendil-works/* (this harness's runtime) and
+ * stripped to what we want:
+ *   - NO summarization. Speaks the assistant's OUTPUT verbatim, not an LLM
+ *     rephrase. (Upstream's only auto-TTS modes were summarize-via-LLM or a
+ *     fixed string; both are gone, along with the createAgentSession machinery.)
+ *   - Streaming: speaks sentence-by-sentence as the model generates, chunked on
+ *     sentence/clause boundaries so Kokoro gets whole clauses (natural prosody).
+ *   - Reasoning/thinking content is never voiced.
+ *   - Interrupts cleanly on a new user turn (kills in-flight audio). It does NOT
+ *     stop on agent_end — that was the upstream "cuts off mid-sentence" bug.
+ *   - Manages a persistent local Kokoro server (spawned under bun, idle-unloads
+ *     the model). Shared across pis; one model in memory at a time.
+ *   - Keeps the /voice TUI (enable / voice / speed / model dtype / sample) and
+ *     the `tts` tool.
  *
- * Persistence:
- *   - Global defaults: ~/.pi/voice/config.json
- *   - Session overrides: pi.appendEntry("voice-session", ...)
- *
- * Auto-TTS events:
- *   - Configured via events: Record<string, EventConfig> in ~/.pi/voice/config.json
- *   - EventConfig is one of:
- *     - { prompt: string, model?: { provider, id } } — summarize event context via LLM, then speak
- *     - { text: string } — speak the text directly (no LLM)
- *   - prompt and text are mutually exclusive
- *   - model is optional per-event; if omitted, inherits the active session model
- *   - Default: agent_end with last_message context
- *   - Any event name can be used; presence in config = enabled
- *   - Built-in pi events (agent_end, turn_end, message_end) use pi.on()
- *   - Custom events (e.g. ask:started) use the shared pi.events bus
- *   - Uses per-event model if configured, otherwise inherits the active session model
- *
- * Agent tool:
- *   - tts: converts text → WAV via the TTS server, plays it.
- *     Uses session overrides > global defaults.
+ * The server is .pi/agent/voice-server/server.ts (our fork). Config lives at
+ * ~/.pi/voice/config.json (shared with the server's cache dir).
  */
 
-import { exec as execCb } from "node:child_process";
+import { type ChildProcess, exec as execCb, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import {
-  AuthStorage,
-  createAgentSession,
-  DefaultResourceLoader,
-  SessionManager,
-} from "@mariozechner/pi-coding-agent";
-import { matchesKey } from "@mariozechner/pi-tui";
-import { Type } from "typebox";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
+import { Type } from "@sinclair/typebox";
 
 // ── Types ──────────────────────────────────────────────────────────
-
-interface ModelConfig {
-  provider: string;
-  id: string;
-}
-
-type EventConfig = SummarizeEventConfig | DirectEventConfig;
-
-interface SummarizeEventConfig {
-  prompt: string;
-  model?: ModelConfig;
-}
-
-interface DirectEventConfig {
-  text: string;
-}
 
 interface FullVoiceConfig {
   enabled: boolean;
@@ -66,7 +36,8 @@ interface FullVoiceConfig {
   speed: number;
   host: string;
   port: number;
-  events?: Record<string, EventConfig>;
+  dtype: string;
+  idleMs: number;
 }
 
 interface VoiceSessionState {
@@ -74,8 +45,6 @@ interface VoiceSessionState {
   voice?: string;
   speed?: number;
 }
-
-// ── Event Types (exported) ──────────────────────────────────────
 
 export type VoiceSpeakSource = "tool" | "auto" | "sample";
 
@@ -85,78 +54,26 @@ export interface VoiceConfigEvent {
   speed: number;
 }
 
-export interface VoiceSpeakStartEvent {
-  text: string;
-  voice: string;
-  speed: number;
-  source: VoiceSpeakSource;
-}
-
-export interface VoiceSpeakEndEvent {
-  text: string;
-  source: VoiceSpeakSource;
-  error?: string;
-}
-
 export interface VoiceEventMap {
   "voice:config": VoiceConfigEvent;
-  "voice:speak_start": VoiceSpeakStartEvent;
-  "voice:speak_end": VoiceSpeakEndEvent;
 }
-
-// ── Configuration Schema (TypeBox) ───────────────────────────────
-
-const ModelSchema = Type.Object({
-  provider: Type.String({ minLength: 1 }),
-  id: Type.String({ minLength: 1 }),
-});
-
-const SummarizeEventConfigSchema = Type.Object({
-  prompt: Type.String({ minLength: 1 }),
-  model: Type.Optional(ModelSchema),
-});
-
-const DirectEventConfigSchema = Type.Object({
-  text: Type.String({ minLength: 1 }),
-});
-
-const EventConfigSchema = Type.Union([SummarizeEventConfigSchema, DirectEventConfigSchema]);
-
-const _VoiceConfigSchema = Type.Object({
-  enabled: Type.Optional(Type.Boolean({ default: true })),
-  voice: Type.Optional(Type.String({ default: "af_heart" })),
-  speed: Type.Optional(Type.Number({ minimum: 0.5, maximum: 3.0, default: 1.0 })),
-  host: Type.Optional(Type.String({ default: "127.0.0.1" })),
-  port: Type.Optional(Type.Number({ minimum: 1, maximum: 65535, default: 8181 })),
-  events: Type.Optional(Type.Record(Type.String(), EventConfigSchema)),
-});
 
 // ── Constants ──────────────────────────────────────────────────────
 
 const CONFIG_DIR = resolve(homedir(), ".pi", "voice");
 const CONFIG_PATH = resolve(CONFIG_DIR, "config.json");
-const SPEED_VALUES = [
-  "0.5",
-  "0.75",
-  "1.0",
-  "1.25",
-  "1.5",
-  "1.75",
-  "2.0",
-  "2.25",
-  "2.5",
-  "2.75",
-  "3.0",
-];
+const DTYPES = ["q4", "q4f16", "q8", "fp16", "fp32"];
+const SPEED_VALUES = ["0.5", "0.75", "1.0", "1.25", "1.5", "1.75", "2.0", "2.25", "2.5", "2.75", "3.0"];
 
-const DEFAULT_SUMMARY_PROMPT =
-  "You are preparing text for a text-to-speech system. " +
-  "You will receive a message from a conversation enclosed in quadruple backticks. " +
-  "Summarize it in one single very short sentence, two at most. " +
-  "Use a dry, matter-of-fact tone. " +
-  "Do not use any markdown formatting, just plain text. " +
-  "Prefer words over symbols or abbreviations, as this will be read aloud. " +
-  "Output only the sentence, nothing else.";
+const DEFAULT_CONFIG: FullVoiceConfig = {
+  enabled: true,
+  voice: "af_heart",
+  speed: 1.0,
+  host: "127.0.0.1",
+  port: 8181,
+  dtype: "q4",
+  idleMs: 300_000,
+};
 
 function speedToIndex(speed: number): number {
   const idx = SPEED_VALUES.findIndex((s) => Number.parseFloat(s) === speed);
@@ -165,15 +82,8 @@ function speedToIndex(speed: number): number {
 
 function voiceHint(name: string): string {
   const langMap: Record<string, string> = {
-    a: "American",
-    b: "British",
-    j: "Japanese",
-    z: "Mandarin",
-    e: "Spanish",
-    f: "French",
-    h: "Hindi",
-    i: "Italian",
-    p: "Brazilian",
+    a: "American", b: "British", j: "Japanese", z: "Mandarin",
+    e: "Spanish", f: "French", h: "Hindi", i: "Italian", p: "Brazilian",
   };
   const genderMap: Record<string, string> = { f: "female", m: "male" };
   const lang = langMap[name[0]] ?? "";
@@ -183,34 +93,20 @@ function voiceHint(name: string): string {
   return lang;
 }
 
-const DEFAULT_CONFIG: FullVoiceConfig = {
-  enabled: true,
-  voice: "af_heart",
-  speed: 1.0,
-  host: "127.0.0.1",
-  port: 8181,
-  events: {
-    agent_end: {
-      prompt: DEFAULT_SUMMARY_PROMPT,
-    },
-  },
-};
-
-// ── Config file persistence (~/.pi/voice/config.json) ──────────────
+// ── Config persistence (~/.pi/voice/config.json) ───────────────────
 
 function loadConfig(): FullVoiceConfig {
   try {
     if (existsSync(CONFIG_PATH)) {
       const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-      // Do NOT merge with DEFAULT_CONFIG — only what the user has written runs.
-      // If events is missing from user config, no auto-TTS events fire.
       return {
         enabled: raw.enabled ?? DEFAULT_CONFIG.enabled,
         voice: raw.voice ?? DEFAULT_CONFIG.voice,
         speed: raw.speed ?? DEFAULT_CONFIG.speed,
         host: raw.host ?? DEFAULT_CONFIG.host,
         port: raw.port ?? DEFAULT_CONFIG.port,
-        events: raw.events,
+        dtype: raw.dtype ?? DEFAULT_CONFIG.dtype,
+        idleMs: raw.idleMs ?? DEFAULT_CONFIG.idleMs,
       };
     }
   } catch {
@@ -224,102 +120,88 @@ function saveConfig(config: FullVoiceConfig) {
   writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`);
 }
 
-// ── Context Extraction ────────────────────────────────────────────
+// ── Text → speech chunking (verbatim, reasoning-filtered, streaming) ──
 
-/**
- * Extract last_message text from event data.
- * Handles both single-message events (turn_end, message_end)
- * and multi-message events (agent_end).
- */
-// biome-ignore lint/suspicious/noExplicitAny: event shape varies by event type
-function extractLastMessage(event: any): string {
-  // agent_end has event.messages (array)
-  if (event.messages && Array.isArray(event.messages) && event.messages.length > 0) {
-    const lastMsg = event.messages[event.messages.length - 1];
-    return extractTextContent(lastMsg?.content);
+// Pull the visible assistant text out of a message, dropping thinking/reasoning.
+// biome-ignore lint/suspicious/noExplicitAny: message shape varies by runtime
+function getContent(message: any): string {
+  const content = message?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      // biome-ignore lint/suspicious/noExplicitAny: content parts have varying shapes
+      .map((part: any) => {
+        if (!part || typeof part.text !== "string") return "";
+        const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
+        return type.includes("thinking") || type.includes("reasoning") ? "" : part.text;
+      })
+      .join("");
   }
-  // turn_end, message_end have event.message
-  return extractTextContent(event.message?.content);
+  return "";
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: content items have varying shapes
-function extractTextContent(content: any[] | undefined): string {
-  if (!content) return "";
-  return (
-    content
-      // biome-ignore lint/suspicious/noExplicitAny: type guard filters unknown content items
-      .filter((c: any): c is { type: "text"; text: string } => c.type === "text")
-      .map((c) => c.text)
-      .join("\n")
-  );
+function trimChunk(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
-// ── Event Processing ───────────────────────────────────────────────
+// Strip markdown/code so the model doesn't read symbols aloud.
+function cleanTextForSpeech(text: string): string {
+  return text
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/[*_~>#\[\]()]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
-async function generateSpeechText(
-  prompt: string,
-  context: string,
-  ctx: ExtensionContext,
-  modelConfig?: ModelConfig,
-): Promise<string | null> {
-  try {
-    // Resolve model: per-event model > active session model
-    const model = modelConfig
-      ? ctx.modelRegistry.find(modelConfig.provider, modelConfig.id)
-      : ctx.model;
-    if (!model) {
-      if (modelConfig) {
-        console.warn(`[pi-voice] Event model not found: ${modelConfig.provider}/${modelConfig.id}`);
-      } else {
-        console.warn("[pi-voice] No active model available for speech generation.");
-      }
-      return null;
+function nextFirstBoundary(text: string): number {
+  const punctuation = text.search(/[.!?,;:—-](?:\s|$)/u);
+  if (punctuation >= 0) return punctuation + 1;
+  const words = text.match(/\S+/g);
+  if (!words || words.length < 8) return -1;
+  let seen = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (/\S/.test(text[i]) && (i === 0 || /\s/.test(text[i - 1]))) seen++;
+    if (seen === 8) {
+      const afterWord = text.slice(i).search(/\s/);
+      return afterWord < 0 ? text.length : i + afterWord;
     }
-
-    const userMessage = context
-      ? `The following is a message from a conversation that you need to summarize:\n\n""""\n${context}\n""""`
-      : "Generate speech text.";
-
-    const loader = new DefaultResourceLoader({
-      cwd: process.cwd(),
-      agentDir: resolve(homedir(), ".pi"),
-      systemPromptOverride: () => prompt,
-    });
-    await loader.reload();
-
-    const { session } = await createAgentSession({
-      model,
-      tools: [],
-      sessionManager: SessionManager.inMemory(),
-      authStorage: AuthStorage.create(),
-      modelRegistry: ctx.modelRegistry,
-      resourceLoader: loader,
-    });
-
-    try {
-      let responseText = "";
-
-      const unsub = session.subscribe((event) => {
-        if (event.type === "message_end" && event.message.role === "assistant") {
-          for (const part of event.message.content) {
-            if (part.type === "text" && part.text) {
-              responseText += part.text;
-            }
-          }
-        }
-      });
-
-      await session.prompt(userMessage);
-      unsub();
-
-      return responseText || null;
-    } finally {
-      session.dispose();
-    }
-  } catch (error) {
-    console.warn("[pi-voice] Error generating speech text:", error);
-    return null;
   }
+  return -1;
+}
+
+function nextSentenceBoundary(text: string): number {
+  const match = /[.!?](?:["')\]]?)(?:\s|$)/u.exec(text);
+  return match ? match.index + match[0].trimEnd().length : -1;
+}
+
+function softSplit(text: string, cap: number): number {
+  const capped = text.slice(0, cap);
+  return Math.max(capped.lastIndexOf(" "), 1);
+}
+
+// Pull complete clauses/sentences out of the buffer. The first chunk flushes
+// fast (lower time-to-first-audio); subsequent chunks wait for sentence ends.
+function drainBoundaries(input: string, firstFlushDone: boolean): { chunks: string[]; remainder: string } {
+  const chunks: string[] = [];
+  let remainder = input;
+
+  while (true) {
+    const boundary = firstFlushDone || chunks.length > 0 ? nextSentenceBoundary(remainder) : nextFirstBoundary(remainder);
+    if (boundary <= 0) break;
+    const chunk = trimChunk(remainder.slice(0, boundary));
+    remainder = remainder.slice(boundary);
+    if (chunk) chunks.push(chunk);
+  }
+
+  if ((firstFlushDone || chunks.length > 0) && remainder.length >= 200) {
+    const split = softSplit(remainder, 200);
+    const chunk = trimChunk(remainder.slice(0, split));
+    remainder = remainder.slice(split);
+    if (chunk) chunks.push(chunk);
+  }
+
+  return { chunks, remainder };
 }
 
 // ── Extension ──────────────────────────────────────────────────────
@@ -336,13 +218,12 @@ export default function (pi: ExtensionAPI) {
       speed: session.speed ?? defaults.speed,
       host: defaults.host,
       port: defaults.port,
-      events: defaults.events,
+      dtype: defaults.dtype,
+      idleMs: defaults.idleMs,
     };
   }
 
-  function serverUrl(): string {
-    return `http://${defaults.host}:${defaults.port}`;
-  }
+  const serverUrl = () => `http://${defaults.host}:${defaults.port}`;
 
   function persistSession() {
     pi.appendEntry<VoiceSessionState>("voice-session", { ...session });
@@ -359,185 +240,278 @@ export default function (pi: ExtensionAPI) {
     defaults = loadConfig();
   }
 
-  // ── Audio playback queue ────────────────────────────────────────
+  // ── Serial speech queue (fetch /tts → afplay), interruptible ──────
 
-  // Serializes audio playback so tts tool and auto-TTS never overlap.
-  type QueueItem = {
-    play: () => Promise<void>;
-  };
-
-  const audioQueue: QueueItem[] = [];
-  let audioPlaying = false;
-
-  function drainAudioQueue(): void {
-    if (audioPlaying) return;
-    const item = audioQueue.shift();
-    if (!item) return;
-    audioPlaying = true;
-    item
-      .play()
-      .catch(() => {})
-      .finally(() => {
-        audioPlaying = false;
-        drainAudioQueue();
-      });
+  interface SpeakItem {
+    text: string;
+    voice?: string;
+    speed?: number;
   }
 
-  function enqueueAudio(item: QueueItem): void {
-    audioQueue.push(item);
-    drainAudioQueue();
+  const queue: SpeakItem[] = [];
+  let running = false;
+  let controller: AbortController | undefined;
+  let currentChild: ChildProcess | undefined;
+  let tmpSeq = 0;
+
+  function stopSpeech() {
+    queue.length = 0;
+    controller?.abort();
+    controller = undefined;
+    currentChild?.kill("SIGTERM");
+    currentChild = undefined;
+    // reset streaming state too
+    buffer = "";
+    processedLen = 0;
+    firstFlushDone = false;
   }
 
-  // ── Speak + Auto-TTS (closured over pi) ─────────────────────
+  function enqueueChunk(text: string, opts?: { voice?: string; speed?: number }) {
+    const cleaned = trimChunk(text);
+    if (!cleaned) return;
+    queue.push({ text: cleaned, voice: opts?.voice, speed: opts?.speed });
+    void drainQueue();
+  }
 
-  // Queued speak — fetches TTS audio and enqueues it for sequential playback.
-  async function speak(
-    text: string,
-    config: FullVoiceConfig,
-    source: VoiceSpeakSource,
-  ): Promise<void> {
-    const startEvent: VoiceSpeakStartEvent = {
-      text,
-      voice: config.voice,
-      speed: config.speed,
-      source,
-    };
-    pi.events.emit("voice:speak_start", startEvent);
-
+  async function drainQueue() {
+    if (running) return;
+    running = true;
     try {
-      const body = {
-        text,
-        voice: config.voice,
-        speed: config.speed,
-      };
-
-      const res = await fetch(`http://${config.host}:${config.port}/tts`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-
-      if (!res.ok) {
-        const errData = (await res.json()) as { error: string };
-        throw new Error(errData.error);
+      while (queue.length > 0) {
+        const item = queue.shift();
+        if (!item) continue;
+        const ac = new AbortController();
+        controller = ac;
+        try {
+          await synthAndPlay(item, getEffective(), ac.signal);
+        } catch (err) {
+          if (!ac.signal.aborted) console.error("[voice] speak failed:", err);
+        } finally {
+          if (controller === ac) controller = undefined;
+        }
       }
-
-      const wavBuffer = Buffer.from(await res.arrayBuffer());
-      const outPath = join(CONFIG_DIR, `voice-${Date.now()}.wav`);
-      mkdirSync(CONFIG_DIR, { recursive: true });
-      writeFileSync(outPath, wavBuffer);
-
-      enqueueAudio({
-        play: () =>
-          new Promise<void>((resolve) => {
-            const cmd = process.platform === "darwin" ? "afplay" : "aplay";
-            execCb(`${cmd} "${outPath}"`, { timeout: 30_000 }, (err) => {
-              if (err) console.warn("[pi-voice] Playback error:", err);
-              const endEvent: VoiceSpeakEndEvent = {
-                text,
-                source,
-                ...(err ? { error: err.message } : {}),
-              };
-              pi.events.emit("voice:speak_end", endEvent);
-              try {
-                unlinkSync(outPath);
-              } catch {
-                /* ignore */
-              }
-              resolve();
-            });
-          }),
-      });
-    } catch (error) {
-      console.warn("[pi-voice] TTS error:", error);
-      const endEvent: VoiceSpeakEndEvent = {
-        text,
-        source,
-        error: error instanceof Error ? error.message : String(error),
-      };
-      pi.events.emit("voice:speak_end", endEvent);
+    } finally {
+      running = false;
+      if (queue.length > 0) void drainQueue();
     }
   }
 
-  async function handleAutoTTS(
-    eventName: string,
-    // biome-ignore lint/suspicious/noExplicitAny: event shape varies by event type
-    event: any,
-    ctx: ExtensionContext,
-    config: FullVoiceConfig,
-  ): Promise<void> {
-    try {
-      if (!config.enabled) return;
-      if (!config.events?.[eventName]) return;
-      // model is optional per-event — falls back to ctx.model
+  async function synthAndPlay(item: SpeakItem, config: FullVoiceConfig, signal: AbortSignal): Promise<void> {
+    const spoken = cleanTextForSpeech(item.text);
+    if (!spoken) return;
 
-      const eventConfig = config.events[eventName];
-
-      // Direct text — speak immediately, no LLM
-      if ("text" in eventConfig) {
-        await speak(eventConfig.text, config, "auto");
-        return;
+    const res = await fetch(`http://${config.host}:${config.port}/tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: spoken, voice: item.voice ?? config.voice, speed: item.speed ?? config.speed }),
+      signal,
+    });
+    if (!res.ok) {
+      let msg = `HTTP ${res.status}`;
+      try {
+        msg = ((await res.json()) as { error?: string }).error ?? msg;
+      } catch {
+        /* ignore */
       }
-
-      // Summarize — extract context and run through LLM
-
-      const context = extractLastMessage(event);
-      if (!context) return;
-
-      const text = await generateSpeechText(eventConfig.prompt, context, ctx, eventConfig.model);
-      if (!text) return;
-
-      await speak(text, config, "auto");
-    } catch (error) {
-      console.warn("[pi-voice] Auto-TTS error:", error);
+      throw new Error(msg);
     }
+
+    const wav = Buffer.from(await res.arrayBuffer());
+    const dir = join(tmpdir(), "secretary-voice");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, `chunk-${process.pid}-${Date.now()}-${tmpSeq++}.wav`);
+    writeFileSync(file, wav);
+
+    await new Promise<void>((resolvePlay, rejectPlay) => {
+      const cmd = process.platform === "darwin" ? "afplay" : "aplay";
+      const child = spawn(cmd, [file]);
+      currentChild = child;
+      const cleanup = () => {
+        signal.removeEventListener("abort", onAbort);
+        if (currentChild === child) currentChild = undefined;
+        try {
+          unlinkSync(file);
+        } catch {
+          /* ignore */
+        }
+      };
+      const onAbort = () => child.kill("SIGTERM");
+      signal.addEventListener("abort", onAbort, { once: true });
+      child.once("error", (err) => {
+        cleanup();
+        rejectPlay(err);
+      });
+      child.once("exit", (code, sig) => {
+        cleanup();
+        if (signal.aborted || code === 0 || sig) resolvePlay();
+        else rejectPlay(new Error(`${cmd} exited ${code}`));
+      });
+    });
   }
 
-  // ── Server API helpers ─────────────────────────────────────────
+  // Direct (non-queued) play used by the /voice sample preview.
+  async function playSample(text: string, config: FullVoiceConfig): Promise<void> {
+    const res = await fetch(`${serverUrl()}/tts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, voice: config.voice, speed: config.speed }),
+    });
+    if (!res.ok) {
+      const err = (await res.json().catch(() => ({}))) as { error?: string };
+      throw new Error(err.error || `Server error ${res.status}`);
+    }
+    const wav = Buffer.from(await res.arrayBuffer());
+    const file = join(CONFIG_DIR, "voice-sample.wav");
+    mkdirSync(CONFIG_DIR, { recursive: true });
+    writeFileSync(file, wav);
+    await new Promise<void>((resolvePlay, rejectPlay) => {
+      const cmd = process.platform === "darwin" ? "afplay" : "aplay";
+      execCb(`${cmd} "${file}"`, { timeout: 30_000 }, (err) => (err ? rejectPlay(err) : resolvePlay()));
+    });
+  }
 
-  async function fetchHealth() {
+  // ── Streaming auto-TTS state ──────────────────────────────────────
+
+  let buffer = "";
+  let processedLen = 0;
+  let firstFlushDone = false;
+
+  // biome-ignore lint/suspicious/noExplicitAny: event shape varies by runtime
+  function isAssistant(message: any): boolean {
+    return message?.role === "assistant";
+  }
+
+  pi.on("message_start", (event: any) => {
+    if (!isAssistant(event.message)) return;
+    // New assistant message: reset chunking state. Do NOT clear the audio
+    // queue — consecutive messages in one turn should speak continuously.
+    buffer = "";
+    processedLen = 0;
+    firstFlushDone = false;
+  });
+
+  pi.on("message_update", (event: any) => {
+    const effective = getEffective();
+    if (!effective.enabled || !isAssistant(event.message)) return;
+
+    const text = getContent(event.message);
+    if (text.length < processedLen) {
+      // stream restarted / content shrank — resync
+      buffer = "";
+      processedLen = 0;
+      firstFlushDone = false;
+    }
+    const next = text.slice(processedLen);
+    processedLen = text.length;
+    if (!next) return;
+
+    buffer += next;
+    const drained = drainBoundaries(buffer, firstFlushDone);
+    buffer = drained.remainder;
+    firstFlushDone = firstFlushDone || drained.chunks.length > 0;
+    for (const chunk of drained.chunks) enqueueChunk(chunk);
+  });
+
+  pi.on("message_end", (event: any) => {
+    if (!isAssistant(event.message)) return;
+    const effective = getEffective();
+    const tail = trimChunk(buffer);
+    if (effective.enabled && tail) enqueueChunk(tail);
+    buffer = "";
+    processedLen = 0;
+    firstFlushDone = false;
+  });
+
+  // Interrupt on a new user turn or an explicit abort. (NOT agent_end — that
+  // fires right after message_end and would cut off the final sentence.)
+  pi.on("turn_start", () => stopSpeech());
+  pi.on("abort", () => stopSpeech());
+
+  // ── Server lifecycle (persistent + idle-unload) ───────────────────
+
+  function serverScriptPath(): string {
+    const agentDir = process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent");
+    return resolve(agentDir, "voice-server", "server.ts");
+  }
+
+  async function fetchHealth(): Promise<{ modelLoaded: boolean; activeDtype: string | null; loading: boolean } | null> {
     try {
-      const res = await fetch(`${serverUrl()}/health`);
+      const res = await fetch(`${serverUrl()}/health`, { signal: AbortSignal.timeout(1500) });
       if (!res.ok) return null;
-      return (await res.json()) as {
-        status: string;
-        activeDtype: string | null;
-        modelLoaded: boolean;
-        loading: boolean;
-      };
+      return (await res.json()) as { modelLoaded: boolean; activeDtype: string | null; loading: boolean };
     } catch {
       return null;
     }
   }
 
   async function fetchVoices(): Promise<string[]> {
-    const res = await fetch(`${serverUrl()}/voices`);
-    if (!res.ok) return [];
-    const data = (await res.json()) as { voices: string[] };
-    return data.voices;
+    try {
+      const res = await fetch(`${serverUrl()}/voices`, { signal: AbortSignal.timeout(3000) });
+      if (!res.ok) return [];
+      return ((await res.json()) as { voices: string[] }).voices;
+    } catch {
+      return [];
+    }
   }
 
-  // ── /voice command ─────────────────────────────────────────────
+  // Spawn the server if it isn't already up, then ensure the configured model
+  // is downloaded + activated. Fire-and-forget; never blocks session start.
+  async function ensureServer(): Promise<void> {
+    const cfg = getEffective();
+    let health = await fetchHealth();
+    if (!health) {
+      const script = serverScriptPath();
+      if (!existsSync(script)) {
+        console.warn(`[voice] server script not found: ${script}`);
+        return;
+      }
+      try {
+        const child = spawn("bun", [script, "--idle-ms", String(cfg.idleMs)], {
+          detached: true,
+          stdio: "ignore",
+        });
+        child.unref();
+      } catch (err) {
+        console.warn("[voice] failed to spawn server (is bun on PATH?):", err);
+        return;
+      }
+      for (let i = 0; i < 50 && !health; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        health = await fetchHealth();
+      }
+      if (!health) {
+        console.warn("[voice] server did not come up");
+        return;
+      }
+    }
+    // Ensure the model is downloaded + active (idempotent on the server).
+    if (!health.modelLoaded && !health.loading) {
+      try {
+        await fetch(`${serverUrl()}/models/download`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dtype: cfg.dtype, activate: true }),
+        });
+      } catch (err) {
+        console.warn("[voice] model activate failed:", err);
+      }
+    }
+  }
+
+  // ── /voice command ────────────────────────────────────────────────
 
   pi.registerCommand("voice", {
-    description: "Configure TTS voice and speed",
+    description: "Configure TTS: enable, voice, speed, model",
     handler: async (_args, ctx) => {
       const effective = getEffective();
-
       const health = await fetchHealth();
-      let voices: string[] = [];
-      if (health?.modelLoaded) {
-        try {
-          voices = await fetchVoices();
-        } catch {
-          voices = [];
-        }
-      }
+      const voices = health?.modelLoaded ? await fetchVoices() : [];
 
-      await ctx.ui.custom((_tui, theme, _kb, done) => {
+      await ctx.ui.custom((tui, theme, _kb, done) => {
         let enabled = effective.enabled;
         let voiceIdx = voices.length > 0 ? Math.max(0, voices.indexOf(effective.voice)) : -1;
         let speedIdx = speedToIndex(effective.speed);
+        let dtypeIdx = Math.max(0, DTYPES.indexOf(defaults.dtype));
         let selectedRow = 0;
         let playing = false;
         let playError: string | null = null;
@@ -547,6 +521,7 @@ export default function (pi: ExtensionAPI) {
           { id: "enabled" },
           ...(voices.length > 0 ? [{ id: "voice" }] : []),
           { id: "speed" },
+          { id: "model" },
         ];
 
         const sampleText = "The quick brown fox jumps over the lazy dog.";
@@ -559,128 +534,45 @@ export default function (pi: ExtensionAPI) {
           });
         }
 
-        async function playSampleTts() {
-          const voice = voices.length > 0 ? voices[voiceIdx] : defaults.voice;
-          const speed = Number.parseFloat(SPEED_VALUES[speedIdx]);
-          pi.events.emit("voice:speak_start", {
-            text: sampleText,
-            voice,
-            speed,
-            source: "sample",
-          });
-          try {
-            const res = await fetch(`${serverUrl()}/tts`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                text: sampleText,
-                voice,
-                speed,
-              }),
-            });
-            if (!res.ok) {
-              const errData = (await res.json()) as { error: string };
-              throw new Error(errData.error || "Server error");
-            }
-            const wavBuffer = Buffer.from(await res.arrayBuffer());
-            const outPath = join(CONFIG_DIR, "voice-sample.wav");
-            mkdirSync(CONFIG_DIR, { recursive: true });
-            writeFileSync(outPath, wavBuffer);
-            const cmd = process.platform === "darwin" ? "afplay" : "aplay";
-            await new Promise<void>((resolve, reject) => {
-              execCb(`${cmd} "${outPath}"`, { timeout: 30_000 }, (err) => {
-                if (err) reject(err);
-                else resolve();
-              });
-            });
-            pi.events.emit("voice:speak_end", { text: sampleText, source: "sample" });
-          } catch (error) {
-            pi.events.emit("voice:speak_end", {
-              text: sampleText,
-              source: "sample",
-              error: error instanceof Error ? error.message : String(error),
-            });
-            throw error;
-          }
-        }
-
         return {
           render(_width: number) {
             const lines: string[] = [];
-
-            // Title
             lines.push(theme.fg("accent", theme.bold("Voice")));
 
-            // Server status
             const statusText = health
               ? health.modelLoaded
                 ? `● Server running (${health.activeDtype})`
                 : health.loading
                   ? "◐ Server loading…"
-                  : "○ Server up (no model)"
-              : "✗ Server not detected";
-            const statusColor = health?.modelLoaded
-              ? "success"
-              : health?.loading
-                ? "warning"
-                : health
-                  ? "dim"
-                  : "dim";
+                  : "○ Server up (model idle/unloaded)"
+              : "✗ Server not detected (auto-starts on use)";
+            const statusColor = health?.modelLoaded ? "success" : health ? "warning" : "dim";
             lines.push(`  ${theme.fg(statusColor, statusText)}`);
-            const serverHint = health?.modelLoaded
-              ? theme.fg("dim", "  pi-voice server stop to stop")
-              : health
-                ? theme.fg("dim", "  pi-voice server start to start")
-                : theme.fg("dim", "  pi-voice server start to start");
-            lines.push(serverHint);
 
-            // Active events
-            const activeEvents = effective.events ? Object.keys(effective.events) : [];
-            if (activeEvents.length > 0) {
-              lines.push(`  ${theme.fg("dim", `Events: ${activeEvents.join(", ")}`)}`);
-            }
-
-            // Setting rows
             for (let i = 0; i < rowDefs.length; i++) {
               const row = rowDefs[i];
               const selected = i === selectedRow;
               const cursor = selected ? "→" : " ";
-
+              const left = selected ? "◂ " : "  ";
+              const right = selected ? " ▸" : "";
               if (row.id === "enabled") {
-                const val = enabled ? "on" : "off";
-                const left = selected ? "◂ " : "  ";
-                const right = selected ? " ▸" : "";
-                lines.push(`${cursor} TTS    ${left}${val}${right}`);
+                lines.push(`${cursor} TTS    ${left}${enabled ? "on" : "off"}${right}`);
               } else if (row.id === "voice") {
                 const val = voices[voiceIdx] ?? "";
-                const hint = voiceHint(val);
-                const left = selected ? "◂ " : "  ";
-                const right = selected ? " ▸" : "";
-                lines.push(
-                  `${cursor} Voice  ${left}${val}${right} ${theme.fg("dim", `(${hint})`)}`,
-                );
+                lines.push(`${cursor} Voice  ${left}${val}${right} ${theme.fg("dim", `(${voiceHint(val)})`)}`);
               } else if (row.id === "speed") {
-                const val = SPEED_VALUES[speedIdx];
-                const left = selected ? "◂ " : "  ";
-                const right = selected ? " ▸" : "";
-                lines.push(`${cursor} Speed  ${left}${val}${right}`);
+                lines.push(`${cursor} Speed  ${left}${SPEED_VALUES[speedIdx]}${right}`);
+              } else if (row.id === "model") {
+                lines.push(`${cursor} Model  ${left}${DTYPES[dtypeIdx]}${right} ${theme.fg("dim", "(dtype)")}`);
               }
             }
 
             lines.push("");
+            if (playing) lines.push(`  ${theme.fg("warning", "▶ Playing sample…")}`);
+            else if (playError) lines.push(`  ${theme.fg("error", `✗ ${playError}`)}`);
+            else if (feedback) lines.push(`  ${theme.fg("success", feedback)}`);
 
-            if (playing) {
-              lines.push(`  ${theme.fg("warning", "▶ Playing sample…")}`);
-            } else if (playError) {
-              lines.push(`  ${theme.fg("error", `✗ ${playError}`)}`);
-            } else if (feedback) {
-              lines.push(`  ${theme.fg("success", feedback)}`);
-            }
-
-            lines.push(
-              theme.fg("dim", " ↑↓ navigate • ←→ change • s save default • r reset • esc close"),
-            );
-
+            lines.push(theme.fg("dim", " ↑↓ navigate • ←→ change • enter sample • s save default • r reset • esc close"));
             return lines;
           },
           invalidate() {},
@@ -690,82 +582,87 @@ export default function (pi: ExtensionAPI) {
               done(undefined);
               return;
             }
-
             if (playError) playError = null;
             if (feedback) feedback = null;
-
             if (playing) return;
 
             if (matchesKey(data, "s")) {
               const voice = voices.length > 0 ? voices[voiceIdx] : defaults.voice;
-              const speed = Number.parseFloat(SPEED_VALUES[speedIdx]);
-              defaults = { ...defaults, enabled, voice, speed };
+              defaults = { ...defaults, enabled, voice, speed: Number.parseFloat(SPEED_VALUES[speedIdx]), dtype: DTYPES[dtypeIdx] };
               saveConfig(defaults);
               feedback = "✓ Saved as default";
-              _tui.requestRender();
+              tui.requestRender();
               return;
             }
-
             if (matchesKey(data, "r")) {
               session = {};
-              // Write full defaults (including agent_end event) back to disk
               saveConfig({ ...DEFAULT_CONFIG });
               defaults = loadConfig();
               persistSession();
               enabled = defaults.enabled;
               voiceIdx = voices.length > 0 ? Math.max(0, voices.indexOf(defaults.voice)) : -1;
               speedIdx = speedToIndex(defaults.speed);
+              dtypeIdx = Math.max(0, DTYPES.indexOf(defaults.dtype));
               emitConfig();
               feedback = "✓ Reset to defaults";
-              _tui.requestRender();
+              tui.requestRender();
               return;
             }
-
             if (matchesKey(data, "up")) {
               selectedRow = (selectedRow - 1 + rowDefs.length) % rowDefs.length;
-              _tui.requestRender();
+              tui.requestRender();
               return;
             }
             if (matchesKey(data, "down")) {
               selectedRow = (selectedRow + 1) % rowDefs.length;
-              _tui.requestRender();
+              tui.requestRender();
               return;
             }
 
             const rowId = rowDefs[selectedRow]?.id;
-
             if (matchesKey(data, "left") || matchesKey(data, "right")) {
               const dir = matchesKey(data, "right") ? 1 : -1;
               if (rowId === "enabled") {
                 enabled = !enabled;
                 session.enabled = enabled;
+                if (!enabled) stopSpeech();
               } else if (rowId === "voice" && voices.length > 0) {
                 voiceIdx = (voiceIdx + dir + voices.length) % voices.length;
                 session.voice = voices[voiceIdx];
               } else if (rowId === "speed") {
                 speedIdx = (speedIdx + dir + SPEED_VALUES.length) % SPEED_VALUES.length;
-                const speed = Number.parseFloat(SPEED_VALUES[speedIdx]);
-                session.speed = speed;
+                session.speed = Number.parseFloat(SPEED_VALUES[speedIdx]);
+              } else if (rowId === "model") {
+                dtypeIdx = (dtypeIdx + dir + DTYPES.length) % DTYPES.length;
+                defaults = { ...defaults, dtype: DTYPES[dtypeIdx] };
+                feedback = `Switching model to ${DTYPES[dtypeIdx]}… (enter to sample)`;
+                // Activate the chosen dtype on the server (downloads if needed).
+                void fetch(`${serverUrl()}/models/download`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ dtype: DTYPES[dtypeIdx], activate: true }),
+                }).catch(() => {});
               }
               persistSession();
               emitConfig();
-              _tui.requestRender();
+              tui.requestRender();
               return;
             }
 
             if (matchesKey(data, "enter")) {
               playing = true;
               playError = null;
-              _tui.requestRender();
-              playSampleTts()
+              tui.requestRender();
+              const voice = voices.length > 0 ? voices[voiceIdx] : defaults.voice;
+              playSample(sampleText, { ...getEffective(), voice, speed: Number.parseFloat(SPEED_VALUES[speedIdx]) })
                 .then(() => {
                   playing = false;
-                  _tui.requestRender();
+                  tui.requestRender();
                 })
                 .catch((err: unknown) => {
                   playing = false;
                   playError = err instanceof Error ? err.message : String(err);
-                  _tui.requestRender();
+                  tui.requestRender();
                 });
               return;
             }
@@ -775,76 +672,50 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── tts tool ─────────────────────────────────────────────────
+  // ── tts tool ──────────────────────────────────────────────────────
 
   pi.registerTool({
     name: "tts",
     label: "Text to Speech",
-    description:
-      "Convert text to speech audio using the Kokoro TTS server. Saves a WAV file and plays it.",
+    description: "Convert text to speech audio using the local Kokoro TTS server and play it.",
     promptSnippet: "Convert text to speech and play audio",
-    promptGuidelines: [
-      "Use tts when the user wants to hear text spoken aloud or convert text to audio.",
-    ],
+    promptGuidelines: ["Use tts when the user explicitly wants to hear text spoken aloud."],
     parameters: Type.Object({
       text: Type.String({ description: "Text to convert to speech" }),
-      voice: Type.Optional(
-        Type.String({ description: "Voice name (defaults to configured voice)" }),
-      ),
-      speed: Type.Optional(
-        Type.Number({
-          description: "Speech speed 0.5-3.0 (defaults to configured speed)",
-          minimum: 0.5,
-          maximum: 3.0,
-        }),
-      ),
+      voice: Type.Optional(Type.String({ description: "Voice name (defaults to configured voice)" })),
+      speed: Type.Optional(Type.Number({ description: "Speech speed 0.5-3.0", minimum: 0.5, maximum: 3.0 })),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_id, params, _signal, _onUpdate, _ctx) {
       const effective = getEffective();
-
       if (!effective.enabled) {
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: "TTS is currently disabled. Use /voice to enable it.",
-            },
-          ],
+          content: [{ type: "text" as const, text: "TTS is disabled. Use /voice to enable it." }],
           details: {},
         };
       }
-
-      const voice = params.voice ?? effective.voice;
-      const speed = params.speed ?? effective.speed;
-
-      speak(params.text, { ...effective, voice, speed }, "tool").catch(() => {
-        /* errors already logged inside speak */
-      });
-
+      enqueueChunk(params.text, { voice: params.voice, speed: params.speed });
       const preview = params.text.length > 80 ? `${params.text.slice(0, 80)}…` : params.text;
-      return {
-        content: [{ type: "text" as const, text: `Speaking: "${preview}"` }],
-        details: {},
-      };
+      return { content: [{ type: "text" as const, text: `Speaking: "${preview}"` }], details: {} };
     },
   });
 
-  // ── Status bar ────────────────────────────────────────────────
+  // ── Status bar ──────────────────────────────────────────────────
 
   function updateStatusBar() {
     if (!currentCtx) return;
     const effective = getEffective();
     const theme = currentCtx.ui.theme;
-    const icon = effective.enabled ? theme.fg("success", "\u266A") : theme.fg("dim", "\u266A");
-    currentCtx.ui.setStatus("pi-voice", icon);
+    const icon = effective.enabled ? theme.fg("success", "♪") : theme.fg("dim", "♪");
+    currentCtx.ui.setStatus("voice", icon);
   }
 
-  // ── Session lifecycle ──────────────────────────────────────────
+  // ── Session lifecycle ───────────────────────────────────────────
 
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     restoreSession(ctx);
     updateStatusBar();
+    void ensureServer().catch((err) => console.warn("[voice] ensureServer:", err));
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -853,12 +724,9 @@ export default function (pi: ExtensionAPI) {
     updateStatusBar();
   });
 
-  // Update status bar on voice:config events (from TUI, alt+v, etc.)
-  pi.events.on("voice:config", () => {
-    updateStatusBar();
-  });
+  pi.events.on("voice:config", () => updateStatusBar());
 
-  // ── Global toggle shortcut (alt+v) ────────────────────────────
+  // ── Toggle shortcut (alt+v) ──────────────────────────────────────
 
   pi.registerShortcut("alt+v", {
     description: "Toggle TTS on/off",
@@ -866,72 +734,10 @@ export default function (pi: ExtensionAPI) {
       const effective = getEffective();
       const next = !effective.enabled;
       session.enabled = next;
+      if (!next) stopSpeech();
       persistSession();
       ctx.ui.notify(`TTS ${next ? "enabled" : "disabled"}`, "info");
-      pi.events.emit("voice:config", {
-        enabled: next,
-        voice: effective.voice,
-        speed: effective.speed,
-      });
+      pi.events.emit("voice:config", { enabled: next, voice: effective.voice, speed: effective.speed });
     },
   });
-
-  // ── Auto-TTS event handlers ─────────────────────────────────────
-
-  // Built-in pi events that carry message data.
-  // Each handler checks at runtime if the event is configured.
-  // Note: pi.on() requires literal event names (not variables) for type safety.
-
-  pi.on("agent_end", async (event, ctx) => {
-    const effective = getEffective();
-    handleAutoTTS("agent_end", event, ctx, effective).catch((err) =>
-      console.warn("[pi-voice] Auto-TTS error:", err),
-    );
-  });
-
-  pi.on("turn_end", async (event, ctx) => {
-    const effective = getEffective();
-    handleAutoTTS("turn_end", event, ctx, effective).catch((err) =>
-      console.warn("[pi-voice] Auto-TTS error:", err),
-    );
-  });
-
-  pi.on("message_end", async (event, ctx) => {
-    const effective = getEffective();
-    handleAutoTTS("message_end", event, ctx, effective).catch((err) =>
-      console.warn("[pi-voice] Auto-TTS error:", err),
-    );
-  });
-
-  const builtinEventNames = new Set(["agent_end", "turn_end", "message_end"]);
-
-  // Custom events from other extensions (via shared event bus).
-  // Any event name in config that isn't a built-in pi event is treated
-  // as a custom event. If the event config has a `text` field, it's
-  // spoken directly without LLM summarization.
-
-  const customUnsubs: Array<() => void> = [];
-
-  function registerCustomEvents() {
-    // Remove previous listeners
-    for (const unsub of customUnsubs) unsub();
-    customUnsubs.length = 0;
-
-    const events = defaults.events;
-    if (!events) return;
-
-    for (const eventName of Object.keys(events)) {
-      if (builtinEventNames.has(eventName)) continue;
-      const unsub = pi.events.on(eventName, (data: unknown) => {
-        if (!currentCtx) return;
-        const effective = getEffective();
-        handleAutoTTS(eventName, data, currentCtx, effective).catch((err) =>
-          console.warn("[pi-voice] Auto-TTS error:", err),
-        );
-      });
-      customUnsubs.push(unsub);
-    }
-  }
-
-  registerCustomEvents();
 }

@@ -1,11 +1,21 @@
 /**
- * Kokoro TTS Server — Persistent HTTP server for the Kokoro ONNX TTS model.
+ * Kokoro TTS Server — local fork of @s1m0n38/pi-voice's server.
+ *
+ * Forked into the secretary repo so we own it (no @mariozechner/* coupling —
+ * this file imports zero pi APIs, only node builtins + kokoro-js). Run as a
+ * standalone bun subprocess spawned by the `voice` extension.
+ *
+ * Changes vs upstream:
+ *   - Idle-unload: the model is disposed after IDLE_MS of no /tts, freeing
+ *     ~88–300 MB while the (tiny) HTTP server stays up. The model transparently
+ *     reloads on the next /tts (reload-on-demand), so one model lives in RAM at
+ *     most and multiple pis share this single server.
  *
  * Endpoints:
- *   GET  /health             → { status, activeDtype, modelLoaded, loading }
+ *   GET  /health             → { status, activeDtype, lastDtype, modelLoaded, loading }
  *   GET  /voices             → { voices: string[] }
  *   GET  /models             → { models: { [dtype]: { downloaded } } }
- *   POST /models/download    → { dtype } → downloads model, blocks until done
+ *   POST /models/download    → { dtype, activate? } → downloads model
  *   POST /models/delete      → { dtype } → removes cached model files
  *   POST /models/activate    → { dtype } → loads model into memory
  *   POST /models/unload      → unloads active model, frees memory
@@ -13,7 +23,7 @@
  *   POST /shutdown           → { status: "shutting down" }
  *
  * Usage:
- *   node --import jiti extensions/server.ts [--port 8181] [--host 127.0.0.1]
+ *   bun server.ts [--port 8181] [--host 127.0.0.1] [--idle-ms 300000]
  */
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -34,11 +44,14 @@ function getArg(name: string, fallback: string): string {
 
 const HOST = getArg("host", "127.0.0.1");
 const PORT = Number.parseInt(getArg("port", "8181"), 10);
+// Unload the model after this many ms of no /tts. <= 0 disables idle-unload.
+const IDLE_MS = Number.parseInt(getArg("idle-ms", "300000"), 10);
 const VOICE_DIR = resolve(homedir(), ".pi", "voice");
 const MANIFEST_PATH = join(VOICE_DIR, "manifest.json");
 
 // ── Cache ──────────────────────────────────────────────────────────
 // Persistent cache outside node_modules — survives npm install cycles.
+// Reuses the existing ~/.pi/voice/cache so already-downloaded models are kept.
 const CACHE_DIR = join(VOICE_DIR, "cache");
 
 function getOnnxPath(dtype: DType): string {
@@ -93,9 +106,7 @@ function markDeleted(dtype: DType) {
 // Handles both: files deleted externally, and files that exist but aren't tracked.
 function syncManifest(): Manifest {
   const manifest = loadManifest();
-  // Remove entries whose files are gone
   const stillExist = manifest.downloaded.filter((d) => isDtypeDownloaded(d));
-  // Discover any untracked files on disk
   const tracked = new Set(stillExist);
   for (const dtype of DTYPES) {
     if (!tracked.has(dtype) && isDtypeDownloaded(dtype)) {
@@ -115,12 +126,38 @@ function syncManifest(): Manifest {
 let KokoroTTS: typeof import("kokoro-js").KokoroTTS = null as never;
 let tts: import("kokoro-js").KokoroTTS | null = null;
 let activeDtype: DType | null = null;
+// Last dtype that was loaded/activated. Survives idle-unload so /tts can
+// transparently reload after the model has been freed.
+let lastDtype: DType | null = null;
 let loading = false;
 
 async function importKokoro() {
   if (KokoroTTS) return;
   const mod = await import("kokoro-js");
   KokoroTTS = mod.KokoroTTS;
+}
+
+// ── Idle-unload ────────────────────────────────────────────────────
+let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+function clearIdleTimer() {
+  if (idleTimer) {
+    clearTimeout(idleTimer);
+    idleTimer = undefined;
+  }
+}
+
+function armIdleTimer() {
+  if (IDLE_MS <= 0) return;
+  clearIdleTimer();
+  idleTimer = setTimeout(() => {
+    idleTimer = undefined;
+    if (loading || !tts) return;
+    console.log(`[voice-server] Idle ${IDLE_MS}ms — unloading model.`);
+    void unloadModel();
+  }, IDLE_MS);
+  // Don't let the idle timer keep the process alive on its own.
+  idleTimer.unref?.();
 }
 
 // ── Model lifecycle ────────────────────────────────────────────────
@@ -130,20 +167,19 @@ async function unloadModel(): Promise<void> {
   if (!tts) return;
   const oldDtype = activeDtype;
   try {
-    console.log(`[pi-voice] Disposing model (${oldDtype}) ...`);
+    console.log(`[voice-server] Disposing model (${oldDtype}) ...`);
     await tts.model.dispose();
   } catch (err) {
     console.warn(
-      `[pi-voice] Error disposing model: ${err instanceof Error ? err.message : String(err)}`,
+      `[voice-server] Error disposing model: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
   tts = null;
   activeDtype = null;
-  // Hint GC to reclaim ONNX/WASM memory
   if (typeof global.gc === "function") {
     global.gc();
   }
-  console.log(`[pi-voice] Model unloaded (${oldDtype}).`);
+  console.log(`[voice-server] Model unloaded (${oldDtype}).`);
 }
 
 async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
@@ -160,10 +196,9 @@ async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
 
   loading = true;
   try {
-    // Unload current model first to free memory before loading the new one
     await unloadModel();
 
-    console.log(`[pi-voice] Loading model: ${MODEL_ID} (dtype=${dtype}) ...`);
+    console.log(`[voice-server] Loading model: ${MODEL_ID} (dtype=${dtype}) ...`);
     const { env } = await import("@huggingface/transformers");
     env.cacheDir = CACHE_DIR;
     env.allowLocalModels = true;
@@ -173,8 +208,9 @@ async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
       device: "cpu",
     });
     activeDtype = dtype;
+    lastDtype = dtype;
     const voiceCount = Object.keys(tts.voices).length;
-    console.log(`[pi-voice] Model loaded (${dtype}). ${voiceCount} voices available.`);
+    console.log(`[voice-server] Model loaded (${dtype}). ${voiceCount} voices available.`);
     return tts;
   } finally {
     loading = false;
@@ -184,50 +220,47 @@ async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
 async function downloadModel(dtype: DType): Promise<void> {
   await importKokoro();
 
-  console.log(`[pi-voice] Downloading model: ${MODEL_ID} (dtype=${dtype}) ...`);
+  console.log(`[voice-server] Downloading model: ${MODEL_ID} (dtype=${dtype}) ...`);
   const { env } = await import("@huggingface/transformers");
   env.cacheDir = CACHE_DIR;
   const instance = await KokoroTTS.from_pretrained(MODEL_ID, {
     dtype,
     device: "cpu",
   });
-  console.log(`[pi-voice] Download complete (${dtype}).`);
+  console.log(`[voice-server] Download complete (${dtype}).`);
   markDownloaded(dtype);
 
-  // Unload the current model first, then activate the new one
-  // (only one model in memory at a time)
   await unloadModel();
   tts = instance;
   activeDtype = dtype;
-  console.log(`[pi-voice] Auto-activated ${dtype}.`);
+  lastDtype = dtype;
+  console.log(`[voice-server] Auto-activated ${dtype}.`);
 }
 
 async function downloadOnlyModel(dtype: DType): Promise<void> {
   await importKokoro();
 
-  console.log(`[pi-voice] Downloading model (no activate): ${MODEL_ID} (dtype=${dtype}) ...`);
+  console.log(`[voice-server] Downloading model (no activate): ${MODEL_ID} (dtype=${dtype}) ...`);
   const { env } = await import("@huggingface/transformers");
   env.cacheDir = CACHE_DIR;
   const instance = await KokoroTTS.from_pretrained(MODEL_ID, {
     dtype,
     device: "cpu",
   });
-  console.log(`[pi-voice] Download complete (${dtype}). Disposing temporary instance...`);
+  console.log(`[voice-server] Download complete (${dtype}). Disposing temporary instance...`);
   markDownloaded(dtype);
 
-  // Immediately dispose — kokoro-js always loads into memory,
-  // so we release it right away to keep the single-model invariant.
   try {
     await instance.model.dispose();
   } catch (err) {
     console.warn(
-      `[pi-voice] Error disposing download instance: ${err instanceof Error ? err.message : String(err)}`,
+      `[voice-server] Error disposing download instance: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
   if (typeof global.gc === "function") {
     global.gc();
   }
-  console.log(`[pi-voice] Model ${dtype} saved to disk (not activated).`);
+  console.log(`[voice-server] Model ${dtype} saved to disk (not activated).`);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -258,12 +291,21 @@ function handleHealth(_req: IncomingMessage, res: ServerResponse) {
   json(res, {
     status: "ok",
     activeDtype,
+    lastDtype,
     modelLoaded: tts !== null,
     loading,
   });
 }
 
 async function handleVoices(_req: IncomingMessage, res: ServerResponse) {
+  // Reload the last model on demand so /voices works after an idle-unload.
+  if (!tts && lastDtype && isDtypeDownloaded(lastDtype)) {
+    try {
+      await loadModel(lastDtype);
+    } catch {
+      /* fall through to the not-loaded response */
+    }
+  }
   if (!tts) {
     json(res, { error: "Model not loaded" }, 503);
     return;
@@ -298,7 +340,7 @@ async function handleModelsDownload(req: IncomingMessage, res: ServerResponse) {
           await loadModel(dtype);
         } catch (err) {
           console.warn(
-            `[pi-voice] Activate failed: ${err instanceof Error ? err.message : String(err)}`,
+            `[voice-server] Activate failed: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
       }
@@ -313,7 +355,7 @@ async function handleModelsDownload(req: IncomingMessage, res: ServerResponse) {
     }
     json(res, { message: `Model ${dtype} downloaded successfully`, dtype });
   } catch (err) {
-    console.error("[pi-voice] Download error:", err);
+    console.error("[voice-server] Download error:", err);
     json(res, { error: err instanceof Error ? err.message : String(err) }, 500);
   }
 }
@@ -333,21 +375,20 @@ async function handleModelsDelete(req: IncomingMessage, res: ServerResponse) {
       return;
     }
 
-    // Unload and dispose if it's the active model
     if (activeDtype === dtype) {
       await unloadModel();
     }
+    if (lastDtype === dtype) lastDtype = null;
 
-    // Delete the ONNX file
     const onnxPath = getOnnxPath(dtype);
     if (existsSync(onnxPath)) {
       rmSync(onnxPath, { force: true });
     }
     markDeleted(dtype);
-    console.log(`[pi-voice] Deleted model: ${dtype}`);
+    console.log(`[voice-server] Deleted model: ${dtype}`);
     json(res, { message: `Model ${dtype} deleted`, dtype });
   } catch (err) {
-    console.error("[pi-voice] Delete error:", err);
+    console.error("[voice-server] Delete error:", err);
     json(res, { error: err instanceof Error ? err.message : String(err) }, 500);
   }
 }
@@ -368,15 +409,17 @@ async function handleModelsActivate(req: IncomingMessage, res: ServerResponse) {
     }
 
     await loadModel(dtype);
+    armIdleTimer();
     json(res, { message: `Model ${dtype} activated`, dtype });
   } catch (err) {
-    console.error("[pi-voice] Activate error:", err);
+    console.error("[voice-server] Activate error:", err);
     json(res, { error: err instanceof Error ? err.message : String(err) }, 500);
   }
 }
 
 async function handleModelsUnload(_req: IncomingMessage, res: ServerResponse) {
   try {
+    clearIdleTimer();
     if (!tts) {
       json(res, { message: "No model loaded" });
       return;
@@ -384,7 +427,7 @@ async function handleModelsUnload(_req: IncomingMessage, res: ServerResponse) {
     await unloadModel();
     json(res, { message: "Model unloaded" });
   } catch (err) {
-    console.error("[pi-voice] Unload error:", err);
+    console.error("[voice-server] Unload error:", err);
     json(res, { error: err instanceof Error ? err.message : String(err) }, 500);
   }
 }
@@ -401,11 +444,8 @@ function enqueueTTS<T>(
 ): Promise<T> {
   ttsQueueDepth++;
   const depth = ttsQueueDepth;
-  console.log(`[pi-voice] Queue: enqueued "${label}" (depth=${depth})`);
+  console.log(`[voice-server] Queue: enqueued "${label}" (depth=${depth})`);
 
-  // Track real client disconnect via the response close event.
-  // Note: req.destroyed is always true after readBody() consumes the stream,
-  // so it cannot be used to detect actual disconnects.
   let disconnected = false;
   const onClose = () => {
     disconnected = true;
@@ -417,14 +457,13 @@ function enqueueTTS<T>(
       ttsQueueDepth--;
       res.removeListener("close", onClose);
 
-      // Client disconnected while waiting — skip synthesis
       if (disconnected) {
-        console.log(`[pi-voice] Queue: skipping "${label}" (client disconnected)`);
+        console.log(`[voice-server] Queue: skipping "${label}" (client disconnected)`);
         reject(new Error("Client disconnected"));
         return;
       }
 
-      console.log(`[pi-voice] Queue: processing "${label}"`);
+      console.log(`[voice-server] Queue: processing "${label}"`);
       try {
         resolve(await fn());
       } catch (err) {
@@ -436,14 +475,20 @@ function enqueueTTS<T>(
 
 async function handleTTS(req: IncomingMessage, res: ServerResponse) {
   try {
-    // Read the body outside the queue so the request is fully consumed
-    // before entering the queue (avoids hanging on slow clients).
     const rawBody = await readBody(req);
     const body = JSON.parse(rawBody);
     const text = (body.text as string | undefined)?.trim();
     const label = text ? `"${text.slice(0, 40)}${text.length > 40 ? "..." : ""}"` : "(empty)";
 
     const result = await enqueueTTS(label, req, res, async () => {
+      // Hold off idle-unload while we're actively synthesizing.
+      clearIdleTimer();
+
+      // Reload-on-demand: if the model was idle-unloaded, bring it back.
+      if (!tts && lastDtype && isDtypeDownloaded(lastDtype)) {
+        await loadModel(lastDtype);
+      }
+
       if (!tts || !activeDtype) {
         return {
           error: "No model loaded. Download and activate a model first.",
@@ -459,7 +504,7 @@ async function handleTTS(req: IncomingMessage, res: ServerResponse) {
       const speed = Number(body.speed ?? 1.0);
 
       console.log(
-        `[pi-voice] Synthesizing: "${text.slice(0, 60)}${text.length > 60 ? "..." : ""}" (voice=${voice}, speed=${speed}, dtype=${activeDtype})`,
+        `[voice-server] Synthesizing: "${text.slice(0, 60)}${text.length > 60 ? "..." : ""}" (voice=${voice}, speed=${speed}, dtype=${activeDtype})`,
       );
 
       const audio = await tts.generate(text, {
@@ -471,6 +516,9 @@ async function handleTTS(req: IncomingMessage, res: ServerResponse) {
       return { wav: float32ToWav(samples, sampleRate) } as const;
     });
 
+    // Restart the idle countdown after each synthesis.
+    armIdleTimer();
+
     if ("error" in result) {
       json(res, { error: result.error }, result.status);
     } else {
@@ -481,11 +529,10 @@ async function handleTTS(req: IncomingMessage, res: ServerResponse) {
       res.end(result.wav);
     }
   } catch (err) {
-    // Don't log client disconnect as an error — it's expected behavior
     if (err instanceof Error && err.message === "Client disconnected") {
       return;
     }
-    console.error("[pi-voice] TTS error:", err);
+    console.error("[voice-server] TTS error:", err);
     if (!res.headersSent) {
       json(res, { error: err instanceof Error ? err.message : String(err) }, 500);
     }
@@ -494,7 +541,7 @@ async function handleTTS(req: IncomingMessage, res: ServerResponse) {
 
 function handleShutdown(req: IncomingMessage, res: ServerResponse) {
   json(res, { status: "shutting down" });
-  console.log("[pi-voice] Shutdown requested");
+  console.log("[voice-server] Shutdown requested");
   req.socket.destroy();
   process.exit(0);
 }
@@ -570,7 +617,7 @@ const server = createServer(async (req, res) => {
 
     json(res, { error: "Not found" }, 404);
   } catch (err) {
-    console.error("[pi-voice] Unhandled error:", err);
+    console.error("[voice-server] Unhandled error:", err);
     if (!res.headersSent) {
       json(res, { error: "Internal server error" }, 500);
     }
@@ -578,7 +625,7 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[pi-voice] Server listening on http://${HOST}:${PORT}`);
-  console.log(`[pi-voice] Cache dir: ${CACHE_DIR}`);
-  console.log("[pi-voice] Use /models to see available models");
+  console.log(`[voice-server] Server listening on http://${HOST}:${PORT}`);
+  console.log(`[voice-server] Cache dir: ${CACHE_DIR}`);
+  console.log(`[voice-server] Idle-unload: ${IDLE_MS > 0 ? `${IDLE_MS}ms` : "disabled"}`);
 });
