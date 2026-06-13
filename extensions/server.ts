@@ -183,6 +183,31 @@ function armIdleTimer() {
 // ── Model lifecycle ────────────────────────────────────────────────
 // Ensures only one model is ever in memory at a time.
 
+// Serialize all load/download ops. Concurrent ops race the active-model state
+// and can corrupt the shared cache (the bug that left "downloaded" but
+// unloadable files). Every model op chains behind the previous one.
+let modelLock: Promise<unknown> = Promise.resolve();
+function withModelLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = modelLock.then(fn, fn);
+  modelLock = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+// A cached file that won't parse is corrupt/partial — drop it so it re-downloads.
+function deleteCorruptDtype(dtype: DType) {
+  try {
+    const p = getOnnxPath(dtype);
+    if (existsSync(p)) rmSync(p, { force: true });
+    markDeleted(dtype);
+    console.warn(`[voice-server] Removed corrupt/partial model file for ${dtype}.`);
+  } catch {
+    /* ignore */
+  }
+}
+
 async function unloadModel(): Promise<void> {
   if (!tts) return;
   const oldDtype = activeDtype;
@@ -203,106 +228,127 @@ async function unloadModel(): Promise<void> {
 }
 
 async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
-  await importKokoro();
+  return withModelLock(async () => {
+    await importKokoro();
 
-  if (tts && activeDtype === dtype) return tts;
-  if (loading) throw new Error("Model is currently loading, please retry");
+    if (tts && activeDtype === dtype) return tts;
 
-  if (!isDtypeDownloaded(dtype)) {
-    throw new Error(
-      `Model dtype "${dtype}" is not downloaded. Download it first via /models/download.`,
-    );
-  }
+    if (!isDtypeDownloaded(dtype)) {
+      throw new Error(
+        `Model dtype "${dtype}" is not downloaded. Download it first via /models/download.`,
+      );
+    }
 
-  loading = true;
-  progress = { dtype, phase: "load", percent: 0 };
-  clearIdleTimer();
-  try {
-    await unloadModel();
+    loading = true;
+    progress = { dtype, phase: "load", percent: 0 };
+    clearIdleTimer();
+    try {
+      await unloadModel();
 
-    console.log(`[voice-server] Loading model: ${MODEL_ID} (dtype=${dtype}) ...`);
-    const { env } = await import("@huggingface/transformers");
-    env.cacheDir = CACHE_DIR;
-    env.allowLocalModels = true;
-    env.useBrowserCache = false;
-    tts = await KokoroTTS.from_pretrained(MODEL_ID, {
-      dtype,
-      device: "cpu",
-      progress_callback: makeProgressCb(dtype, "load"),
-    });
-    activeDtype = dtype;
-    lastDtype = dtype;
-    const voiceCount = Object.keys(tts.voices).length;
-    console.log(`[voice-server] Model loaded (${dtype}). ${voiceCount} voices available.`);
-    return tts;
-  } finally {
-    loading = false;
-    progress = null;
-    armIdleTimer();
-  }
+      console.log(`[voice-server] Loading model: ${MODEL_ID} (dtype=${dtype}) ...`);
+      const { env } = await import("@huggingface/transformers");
+      env.cacheDir = CACHE_DIR;
+      env.allowLocalModels = true;
+      env.useBrowserCache = false;
+      try {
+        tts = await KokoroTTS.from_pretrained(MODEL_ID, {
+          dtype,
+          device: "cpu",
+          progress_callback: makeProgressCb(dtype, "load"),
+        });
+      } catch (err) {
+        deleteCorruptDtype(dtype);
+        throw err;
+      }
+      activeDtype = dtype;
+      lastDtype = dtype;
+      const voiceCount = Object.keys(tts.voices).length;
+      console.log(`[voice-server] Model loaded (${dtype}). ${voiceCount} voices available.`);
+      return tts;
+    } finally {
+      loading = false;
+      progress = null;
+      armIdleTimer();
+    }
+  });
 }
 
 async function downloadModel(dtype: DType): Promise<void> {
-  await importKokoro();
+  return withModelLock(async () => {
+    await importKokoro();
 
-  console.log(`[voice-server] Downloading model: ${MODEL_ID} (dtype=${dtype}) ...`);
-  progress = { dtype, phase: "download", percent: 0 };
-  clearIdleTimer();
-  try {
-    const { env } = await import("@huggingface/transformers");
-    env.cacheDir = CACHE_DIR;
-    const instance = await KokoroTTS.from_pretrained(MODEL_ID, {
-      dtype,
-      device: "cpu",
-      progress_callback: makeProgressCb(dtype, "download"),
-    });
-    console.log(`[voice-server] Download complete (${dtype}).`);
-    markDownloaded(dtype);
+    console.log(`[voice-server] Downloading model: ${MODEL_ID} (dtype=${dtype}) ...`);
+    progress = { dtype, phase: "download", percent: 0 };
+    clearIdleTimer();
+    try {
+      const { env } = await import("@huggingface/transformers");
+      env.cacheDir = CACHE_DIR;
+      let instance: import("kokoro-js").KokoroTTS;
+      try {
+        instance = await KokoroTTS.from_pretrained(MODEL_ID, {
+          dtype,
+          device: "cpu",
+          progress_callback: makeProgressCb(dtype, "download"),
+        });
+      } catch (err) {
+        deleteCorruptDtype(dtype);
+        throw err;
+      }
+      console.log(`[voice-server] Download complete (${dtype}).`);
+      markDownloaded(dtype);
 
-    await unloadModel();
-    tts = instance;
-    activeDtype = dtype;
-    lastDtype = dtype;
-    console.log(`[voice-server] Auto-activated ${dtype}.`);
-  } finally {
-    progress = null;
-    armIdleTimer();
-  }
+      await unloadModel();
+      tts = instance;
+      activeDtype = dtype;
+      lastDtype = dtype;
+      console.log(`[voice-server] Auto-activated ${dtype}.`);
+    } finally {
+      progress = null;
+      armIdleTimer();
+    }
+  });
 }
 
 async function downloadOnlyModel(dtype: DType): Promise<void> {
-  await importKokoro();
+  return withModelLock(async () => {
+    await importKokoro();
 
-  console.log(`[voice-server] Downloading model (no activate): ${MODEL_ID} (dtype=${dtype}) ...`);
-  progress = { dtype, phase: "download", percent: 0 };
-  clearIdleTimer();
-  let instance: import("kokoro-js").KokoroTTS;
-  try {
-    const { env } = await import("@huggingface/transformers");
-    env.cacheDir = CACHE_DIR;
-    instance = await KokoroTTS.from_pretrained(MODEL_ID, {
-      dtype,
-      device: "cpu",
-      progress_callback: makeProgressCb(dtype, "download"),
-    });
-  } finally {
-    progress = null;
-    armIdleTimer();
-  }
-  console.log(`[voice-server] Download complete (${dtype}). Disposing temporary instance...`);
-  markDownloaded(dtype);
+    console.log(`[voice-server] Downloading model (no activate): ${MODEL_ID} (dtype=${dtype}) ...`);
+    progress = { dtype, phase: "download", percent: 0 };
+    clearIdleTimer();
+    let instance: import("kokoro-js").KokoroTTS;
+    try {
+      const { env } = await import("@huggingface/transformers");
+      env.cacheDir = CACHE_DIR;
+      try {
+        instance = await KokoroTTS.from_pretrained(MODEL_ID, {
+          dtype,
+          device: "cpu",
+          progress_callback: makeProgressCb(dtype, "download"),
+        });
+      } catch (err) {
+        deleteCorruptDtype(dtype);
+        throw err;
+      }
+    } finally {
+      progress = null;
+      armIdleTimer();
+    }
+    console.log(`[voice-server] Download complete (${dtype}). Disposing temporary instance...`);
+    markDownloaded(dtype);
 
-  try {
-    await instance.model.dispose();
-  } catch (err) {
-    console.warn(
-      `[voice-server] Error disposing download instance: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  if (typeof global.gc === "function") {
-    global.gc();
-  }
-  console.log(`[voice-server] Model ${dtype} saved to disk (not activated).`);
+    try {
+      await instance.model.dispose();
+    } catch (err) {
+      console.warn(
+        `[voice-server] Error disposing download instance: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    if (typeof global.gc === "function") {
+      global.gc();
+    }
+    console.log(`[voice-server] Model ${dtype} saved to disk (not activated).`);
+  });
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
