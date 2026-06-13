@@ -472,6 +472,18 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  // Which dtypes are actually downloaded on disk.
+  async function fetchDownloaded(): Promise<Set<string>> {
+    try {
+      const res = await fetch(`${serverUrl()}/models`, { signal: AbortSignal.timeout(2000) });
+      if (!res.ok) return new Set();
+      const data = (await res.json()) as { models: Record<string, { downloaded: boolean }> };
+      return new Set(Object.entries(data.models).filter(([, v]) => v.downloaded).map(([k]) => k));
+    } catch {
+      return new Set();
+    }
+  }
+
   // Spawn the server if it isn't already up, then ensure the configured model
   // is downloaded + activated. Fire-and-forget; never blocks session start.
   async function ensureServer(): Promise<void> {
@@ -531,14 +543,25 @@ export default function (pi: ExtensionAPI) {
         let voiceIdx = voices.length > 0 ? Math.max(0, voices.indexOf(effective.voice)) : -1;
         let speedIdx = speedToIndex(effective.speed);
         let dtypeIdx = Math.max(0, DTYPES.indexOf(defaults.dtype));
-        // The dtype loaded on the server when the modal opened. We only fire a
-        // (potentially huge) download/activate on close, and only if the final
-        // selection differs — scrubbing left/right must NOT load models.
-        const initialActiveDtype = health?.activeDtype ?? null;
+        // Live server state — refreshed by a poller while the modal is open so
+        // downloads/activations are reflected (active vs downloaded vs not).
+        let liveActive = health?.activeDtype ?? null;
+        let liveLoaded = health?.modelLoaded ?? false;
+        let downloaded = new Set<string>();
         let selectedRow = 0;
         let playing = false;
         let playError: string | null = null;
         let feedback: string | null = null;
+
+        const refresh = async () => {
+          const [h, d] = await Promise.all([fetchHealth(), fetchDownloaded()]);
+          liveActive = h?.activeDtype ?? null;
+          liveLoaded = h?.modelLoaded ?? false;
+          downloaded = d;
+          tui.requestRender();
+        };
+        void refresh();
+        const pollTimer = setInterval(() => void refresh(), 1500);
 
         const rowDefs: Array<{ id: string }> = [
           { id: "enabled" },
@@ -562,14 +585,10 @@ export default function (pi: ExtensionAPI) {
             const lines: string[] = [];
             lines.push(theme.fg("accent", theme.bold("Voice")));
 
-            const statusText = health
-              ? health.modelLoaded
-                ? `● Server running (${health.activeDtype})`
-                : health.loading
-                  ? "◐ Server loading…"
-                  : "○ Server up (model idle/unloaded)"
-              : "✗ Server not detected (auto-starts on use)";
-            const statusColor = health?.modelLoaded ? "success" : health ? "warning" : "dim";
+            const statusText = liveLoaded
+              ? `● Server running (${liveActive})`
+              : "○ Server up (model idle/unloaded)";
+            const statusColor = liveLoaded ? "success" : "warning";
             lines.push(`  ${theme.fg(statusColor, statusText)}`);
 
             for (let i = 0; i < rowDefs.length; i++) {
@@ -586,8 +605,9 @@ export default function (pi: ExtensionAPI) {
               } else if (row.id === "speed") {
                 lines.push(`${cursor} Speed  ${left}${SPEED_VALUES[speedIdx]}${right}`);
               } else if (row.id === "model") {
-                const tag = DTYPES[dtypeIdx] === initialActiveDtype ? "active" : "loads on close";
-                lines.push(`${cursor} Model  ${left}${DTYPES[dtypeIdx]}${right} ${theme.fg("dim", `(${tag})`)}`);
+                const d = DTYPES[dtypeIdx];
+                const tag = d === liveActive ? "active" : downloaded.has(d) ? "downloaded" : "not downloaded";
+                lines.push(`${cursor} Model  ${left}${d}${right} ${theme.fg("dim", `(${tag})`)}`);
               }
             }
 
@@ -602,10 +622,11 @@ export default function (pi: ExtensionAPI) {
           invalidate() {},
           handleInput(data: string) {
             if (matchesKey(data, "escape")) {
+              clearInterval(pollTimer);
               persistSession();
               // Apply the model choice on close — one load, only if it changed.
               const chosen = DTYPES[dtypeIdx];
-              if (chosen !== initialActiveDtype) {
+              if (chosen !== liveActive) {
                 startProgressPolling();
                 void fetch(`${serverUrl()}/models/download`, {
                   method: "POST",
@@ -670,11 +691,14 @@ export default function (pi: ExtensionAPI) {
               } else if (rowId === "model") {
                 // Selection only — do NOT load/download here. Applied on close.
                 dtypeIdx = (dtypeIdx + dir + DTYPES.length) % DTYPES.length;
-                defaults = { ...defaults, dtype: DTYPES[dtypeIdx] };
+                const d = DTYPES[dtypeIdx];
+                defaults = { ...defaults, dtype: d };
                 feedback =
-                  DTYPES[dtypeIdx] === initialActiveDtype
-                    ? `Model ${DTYPES[dtypeIdx]} (active)`
-                    : `Model ${DTYPES[dtypeIdx]} — loads on close`;
+                  d === liveActive
+                    ? `Model ${d} (active)`
+                    : downloaded.has(d)
+                      ? `Model ${d} — loads on close`
+                      : `Model ${d} — downloads on close`;
               }
               persistSession();
               emitConfig();
