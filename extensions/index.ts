@@ -639,7 +639,8 @@ export default function (pi: ExtensionAPI) {
               if (rowId === "enabled") {
                 enabled = !enabled;
                 session.enabled = enabled;
-                if (!enabled) stopSpeech();
+                if (enabled) void ensureServer().catch(() => {});
+                else stopSpeech();
               } else if (rowId === "voice" && voices.length > 0) {
                 voiceIdx = (voiceIdx + dir + voices.length) % voices.length;
                 session.voice = voices[voiceIdx];
@@ -727,7 +728,8 @@ export default function (pi: ExtensionAPI) {
     currentCtx = ctx;
     restoreSession(ctx);
     updateStatusBar();
-    void ensureServer().catch((err) => console.warn("[voice] ensureServer:", err));
+    // Only spin up the (heavy) Kokoro server if TTS is actually enabled.
+    if (getEffective().enabled) void ensureServer().catch((err) => console.warn("[voice] ensureServer:", err));
   });
 
   pi.on("session_tree", async (_event, ctx) => {
@@ -746,7 +748,8 @@ export default function (pi: ExtensionAPI) {
       const effective = getEffective();
       const next = !effective.enabled;
       session.enabled = next;
-      if (!next) stopSpeech();
+      if (next) void ensureServer().catch((err) => console.warn("[voice] ensureServer:", err));
+      else stopSpeech();
       persistSession();
       ctx.ui.notify(`TTS ${next ? "enabled" : "disabled"}`, "info");
       pi.events.emit("voice:config", { enabled: next, voice: effective.voice, speed: effective.speed });
