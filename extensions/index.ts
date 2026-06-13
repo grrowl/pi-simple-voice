@@ -314,13 +314,25 @@ export default function (pi: ExtensionAPI) {
   let processedLen = 0;
   let firstFlushDone = false;
 
+  // Depth of in-flight tool executions. fork/advisor subagents run *inside* the
+  // main agent's tool call, so their assistant messages stream on this same bus
+  // while a tool is executing. The main agent never narrates during a tool call,
+  // so we only voice messages at depth 0 — i.e. the top-level agent's output.
+  let toolDepth = 0;
+  pi.on("tool_execution_start", () => {
+    toolDepth++;
+  });
+  pi.on("tool_execution_end", () => {
+    if (toolDepth > 0) toolDepth--;
+  });
+
   // biome-ignore lint/suspicious/noExplicitAny: event shape varies by runtime
   function isAssistant(message: any): boolean {
     return message?.role === "assistant";
   }
 
   pi.on("message_start", (event: any) => {
-    if (!isAssistant(event.message)) return;
+    if (toolDepth > 0 || !isAssistant(event.message)) return;
     // New assistant message: reset chunking state. Do NOT clear the audio
     // queue — consecutive messages in one turn should speak continuously.
     buffer = "";
@@ -330,7 +342,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("message_update", (event: any) => {
     const effective = getEffective();
-    if (!effective.enabled || !isAssistant(event.message)) return;
+    if (toolDepth > 0 || !effective.enabled || !isAssistant(event.message)) return;
 
     const text = getContent(event.message);
     if (text.length < processedLen) {
@@ -351,7 +363,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("message_end", (event: any) => {
-    if (!isAssistant(event.message)) return;
+    if (toolDepth > 0 || !isAssistant(event.message)) return;
     const effective = getEffective();
     const tail = trimChunk(buffer);
     if (effective.enabled && tail) enqueueChunk(tail);
