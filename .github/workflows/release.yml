@@ -19,6 +19,5 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      # Manifest mode: reads release-please-config.json + .release-please-manifest.json
       - uses: googleapis/release-please-action@8b8fd2cc23b2e18957157a9d923d75aa0c6f6ad5 # v4
-        with:
-          release-type: node

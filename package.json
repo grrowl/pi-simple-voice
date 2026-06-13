@@ -1,6 +1,6 @@
 {
   "name": "pi-simple-voice",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Streaming, verbatim Kokoro TTS for the Pi agent — speaks the assistant's output as it streams, no summarization.",
   "type": "module",
   "license": "MIT",
