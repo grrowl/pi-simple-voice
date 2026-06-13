@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.0] — pi-simple-voice fork
+
+Forked from [s1m0n38/pi-voice](https://github.com/s1m0n38/pi-voice) `v2.0.1`.
+
+### Changed
+* Speaks the assistant's output **verbatim and streaming** (sentence-boundary
+  chunking) instead of summarizing each response with an LLM.
+* Interrupts on `turn_start`/`abort` rather than `agent_end` (fixes the
+  cut-off-final-sentence behavior).
+* Server **self-exits after an idle timeout** (`idleMs`, default 15 min) and is
+  re-spawned on demand; the extension manages its lifecycle.
+* `/voice` gains a **model dtype** row (loads lazily on modal close) and the
+  `♪` status bar reports download/load progress.
+* Server serializes model ops and self-heals corrupt cache files.
+* Runtime peer-deps moved to `@earendil-works/*`.
+
+### Removed
+* The agent-facing `tts` tool — speech is driven by the assistant's output, not
+  a tool the model can call.
+* LLM summarization and per-event prompt config.
+
+---
+
+_Upstream history below._
+
 ## [2.0.1](https://github.com/S1M0N38/pi-voice/compare/v2.0.0...v2.0.1) (2026-05-07)
 
 

@@ -1,23 +1,34 @@
-# pi-voice
+# pi-simple-voice
 
-Give your Pi agent a voice.
+Give your Pi agent a voice — **streaming** and **verbatim**.
 
-pi-voice is a text-to-speech package for the [Pi coding agent](https://github.com/mariozechner/pi). It runs a local HTTP server powered by [Kokoro ONNX](https://github.com/hexgrad/kokoro) and exposes a `/voice` settings UI, a `tts` tool, and automatic speech on agent responses.
+pi-simple-voice is a text-to-speech package for the [Pi coding agent](https://github.com/earendil-works/pi). It speaks the assistant's output **as it streams**, sentence by sentence, with **no summarization** — you hear exactly what the agent writes. It runs a local HTTP server powered by [Kokoro ONNX](https://github.com/hexgrad/kokoro) and exposes a `/voice` settings UI.
 
-**How it works:** The server loads a single Kokoro ONNX model into memory and exposes a REST API for synthesis. The pi extension talks to this server over HTTP — it never loads the model directly. This separation keeps the agent lightweight while the server handles the heavy ONNX inference.
+> **This is a fork of [s1m0n38/pi-voice](https://github.com/s1m0n38/pi-voice)** (MIT). See [What's different](#whats-different-from-upstream) below. Huge thanks to the upstream author — the Kokoro server, `/voice` TUI, and model management started there.
+
+**How it works:** A small local server loads a single Kokoro ONNX model into memory and exposes a REST API for synthesis. The pi extension talks to it over HTTP — it never loads the model itself. The extension spawns the server on demand; the server self-exits after an idle timeout (default 15 min) and is re-spawned when next needed, so one model lives in RAM and is shared across all your pi sessions.
+
+## What's different from upstream
+
+| | upstream `pi-voice` | this fork |
+|---|---|---|
+| Speech text | LLM **summarizes** each response | **verbatim** — speaks what the agent writes |
+| Timing | one utterance at `agent_end` | **streaming**, on sentence boundaries as tokens arrive |
+| Reasoning | — | thinking/reasoning content is never voiced |
+| Interrupt | `agent_end` (could cut the final sentence) | `turn_start` / `abort` (clean) |
+| `tts` tool | agent can call it | **removed** — speech is a side-effect of output, not a tool |
+| Server lifetime | started/stopped via CLI | extension-managed; **self-exits when idle**, re-spawned on demand |
+| Runtime | `@mariozechner/*` | `@earendil-works/*` |
 
 ## Installation
 
 ```bash
-pi install npm:@s1m0n38/pi-voice
+pi install npm:pi-simple-voice
 ```
 
-The `pi-voice` CLI is available after install. Start the server and download the default model:
+The extension auto-spawns the server and downloads the default `q4` model (~291 MB) the first time speech is enabled. The `pi-simple-voice` CLI is also available for manual control.
 
-```bash
-pi-voice server                      # start on 127.0.0.1:8181
-pi-voice download q4                 # download + activate the q4 model (~291 MB)
-```
+> Requires [`bun`](https://bun.sh) on `PATH` — the extension spawns the server under bun.
 
 ## Usage
 
@@ -25,84 +36,59 @@ pi-voice download q4                 # download + activate the q4 model (~291 MB
 
 Open the interactive settings UI inside Pi:
 
-<!-- TODO: add screenshot of /voice TUI -->
-
 | Setting | Controls | Keys |
 |---------|----------|------|
 | TTS | Enable/disable speech | ← → |
 | Voice | Speaker voice (with language/gender hints) | ← → |
 | Speed | Speech rate (0.5×–3.0×) | ← → |
+| Model | Quantization dtype | ← → (loads on close) |
 
-Navigate with ↑ ↓, press **Enter** to play a sample, **r** to reset defaults, **Esc** to close.
+Navigate with ↑ ↓, **Enter** to play a sample, **r** to reset, **Esc** to close. Toggle speech quickly with **alt+v**. The `♪` status bar shows live download/load progress (e.g. `♪ ↓ q4 25%`).
 
-Settings persist in `~/.pi/voice/config.json` across sessions.
+Settings persist in `~/.pi/voice/config.json`.
 
-### `tts` tool
-
-The agent can speak at any time using the `tts` tool:
-
-```
-> Use the tts tool to say "Build complete, all tests passing"
-```
-
-### Auto-TTS
-
-Enable automatic speech after every agent response by editing `~/.pi/voice/config.json`:
+### Configuration
 
 ```json
 {
   "enabled": true,
   "voice": "af_heart",
   "speed": 1.0,
-  "events": {
-    "agent_end": {
-      "prompt": "Summarize in one short sentence for text-to-speech.",
-      "model": { "provider": "anthropic", "id": "claude-haiku-4-5" }
-    },
-    "turn_end": {
-      "prompt": "Summarize briefly."
-    },
-    "custom_event": {
-      "text": "Custom event triggered."
-    }
-  }
+  "host": "127.0.0.1",
+  "port": 8181,
+  "dtype": "q4",
+  "idleMs": 900000
 }
 ```
 
-Each event key enables auto-TTS for that event. The value is one of:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `prompt` | `string` | LLM system prompt for summarizing the event message. The event's last message is provided as context. |
-| `text` | `string` | Fixed text to speak directly — no LLM call. Mutually exclusive with `prompt`. |
-| `model` | `{ provider, id }` | Optional. Model to use for summarization. If omitted, inherits the active session model. |
-
-Built-in pi events (`agent_end`, `turn_end`, `message_end`) use the message data from the event. Any other key is treated as a custom event on the shared `pi.events` bus.
+`idleMs` is how long the server sits idle before self-exiting (default 15 min). There is no summarization model and no per-event prompt config — speech is always the assistant's verbatim output.
 
 ## CLI Reference
 
 ```bash
-pi-voice server                              # start server (default: 127.0.0.1:8181)
-pi-voice server --host 0.0.0.0 --port 9090   # custom host/port
-pi-voice download q4                         # download + activate model dtype
-pi-voice delete q4                           # delete cached model files
-pi-voice status                              # show server status and active model
-pi-voice voices                              # list available voices
+pi-simple-voice server status                # show server status
+pi-simple-voice server start                 # start server, load default model
+pi-simple-voice server stop                  # stop server
+pi-simple-voice server restart               # restart
+pi-simple-voice model list                   # list dtypes + download status
+pi-simple-voice model load <dtype>           # load (downloads if needed)
+pi-simple-voice model download <dtype>       # download without loading
+pi-simple-voice model remove <dtype>         # delete cached files
 ```
+
+Options: `--host <host>` `--port <port>` (defaults `127.0.0.1:8181`).
 
 ### Model dtypes
 
 | Dtype | Size | Quality | Notes |
 |-------|------|---------|-------|
 | `q4` | ~291 MB | Good | 4-bit matmul — recommended default |
-| `q4f16` | ~147 MB | Good | 4-bit matmul + fp16 weights — smaller, good trade-off |
+| `q4f16` | ~147 MB | Good | 4-bit matmul + fp16 weights |
 | `q8` | ~88 MB | Great | 8-bit quantized — best quality/size ratio |
 | `fp16` | ~156 MB | Excellent | Half-precision floats |
-| `fp32` | ~310 MB | Best | Full-precision floats — largest, highest quality |
+| `fp32` | ~310 MB | Best | Full-precision floats |
 
-Only one model is loaded at a time. Downloading or activating a new model automatically unloads the previous one.
-
-Model files are cached at `~/.pi/voice/cache/` and persist across `npm install` cycles. To reclaim disk space, use `pi-voice delete <dtype>`.
+Only one model is loaded at a time. Files are cached at `~/.pi/voice/cache/`.
 
 ## API
 
@@ -110,10 +96,10 @@ The server exposes HTTP endpoints at `http://127.0.0.1:8181`:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Server status, active dtype, model loaded |
+| GET | `/health` | Status, active dtype, model loaded, download/load progress |
 | GET | `/voices` | Available voice names |
 | GET | `/models` | All dtypes with download status |
-| POST | `/models/download` | Download + activate a dtype |
+| POST | `/models/download` | Download (+ optionally activate) a dtype |
 | POST | `/models/delete` | Delete cached model files |
 | POST | `/models/activate` | Load a downloaded model |
 | POST | `/models/unload` | Unload model, free memory |
@@ -122,36 +108,14 @@ The server exposes HTTP endpoints at `http://127.0.0.1:8181`:
 
 ## Events
 
-pi-voice emits events on the pi event bus (`pi.events`) so other extensions can integrate with TTS activity.
-
-| Event | Payload | When |
-|-------|---------|------|
-| `voice:config` | `{ enabled, voice, speed }` | Any setting change via `/voice` |
-| `voice:speak_start` | `{ text, voice, speed, source }` | Synthesis requested |
-| `voice:speak_end` | `{ text, source, error? }` | Playback done or failed |
-
-`source` is `"tool"` (LLM invoked tts), `"auto"` (auto-TTS handler), or `"sample"` (/voice preview).
+The extension emits `voice:config` on the pi event bus (`pi.events`) whenever a setting changes via `/voice`:
 
 ```typescript
-// React to config changes
 pi.events.on("voice:config", ({ enabled, voice, speed }) => {
   // update status bar, toggle features, etc.
-});
-
-// Track speech activity
-pi.events.on("voice:speak_start", ({ text, source }) => {
-  if (source === "auto") console.log(`[TTS] ${text}`);
-});
-
-pi.events.on("voice:speak_end", ({ error }) => {
-  if (error) console.warn(`TTS failed: ${error}`);
 });
 ```
 
 ## License
 
-MIT
-
----
-
-Bootstrapped from [pi-package-template](https://github.com/S1M0N38/pi-package-template).
+MIT — same as upstream. Forked from [s1m0n38/pi-voice](https://github.com/s1m0n38/pi-voice).
