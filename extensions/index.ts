@@ -28,6 +28,12 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
+import {
+  cleanTextForSpeech,
+  drainBoundaries,
+  getContent,
+  trimChunk,
+} from "./chunking.ts";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -124,87 +130,6 @@ function saveConfig(config: FullVoiceConfig) {
 // ── Text → speech chunking (verbatim, reasoning-filtered, streaming) ──
 
 // Pull the visible assistant text out of a message, dropping thinking/reasoning.
-// biome-ignore lint/suspicious/noExplicitAny: message shape varies by runtime
-function getContent(message: any): string {
-  const content = message?.content;
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      // biome-ignore lint/suspicious/noExplicitAny: content parts have varying shapes
-      .map((part: any) => {
-        if (!part || typeof part.text !== "string") return "";
-        const type = typeof part.type === "string" ? part.type.toLowerCase() : "";
-        return type.includes("thinking") || type.includes("reasoning") ? "" : part.text;
-      })
-      .join("");
-  }
-  return "";
-}
-
-function trimChunk(text: string): string {
-  return text.replace(/\s+/g, " ").trim();
-}
-
-// Strip markdown/code so the model doesn't read symbols aloud.
-function cleanTextForSpeech(text: string): string {
-  return text
-    .replace(/```[\s\S]*?```/g, "")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/[*_~>#\[\]()]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function nextFirstBoundary(text: string): number {
-  const punctuation = text.search(/[.!?,;:—-](?:\s|$)/u);
-  if (punctuation >= 0) return punctuation + 1;
-  const words = text.match(/\S+/g);
-  if (!words || words.length < 8) return -1;
-  let seen = 0;
-  for (let i = 0; i < text.length; i++) {
-    if (/\S/.test(text[i]) && (i === 0 || /\s/.test(text[i - 1]))) seen++;
-    if (seen === 8) {
-      const afterWord = text.slice(i).search(/\s/);
-      return afterWord < 0 ? text.length : i + afterWord;
-    }
-  }
-  return -1;
-}
-
-function nextSentenceBoundary(text: string): number {
-  const match = /[.!?](?:["')\]]?)(?:\s|$)/u.exec(text);
-  return match ? match.index + match[0].trimEnd().length : -1;
-}
-
-function softSplit(text: string, cap: number): number {
-  const capped = text.slice(0, cap);
-  return Math.max(capped.lastIndexOf(" "), 1);
-}
-
-// Pull complete clauses/sentences out of the buffer. The first chunk flushes
-// fast (lower time-to-first-audio); subsequent chunks wait for sentence ends.
-function drainBoundaries(input: string, firstFlushDone: boolean): { chunks: string[]; remainder: string } {
-  const chunks: string[] = [];
-  let remainder = input;
-
-  while (true) {
-    const boundary = firstFlushDone || chunks.length > 0 ? nextSentenceBoundary(remainder) : nextFirstBoundary(remainder);
-    if (boundary <= 0) break;
-    const chunk = trimChunk(remainder.slice(0, boundary));
-    remainder = remainder.slice(boundary);
-    if (chunk) chunks.push(chunk);
-  }
-
-  if ((firstFlushDone || chunks.length > 0) && remainder.length >= 200) {
-    const split = softSplit(remainder, 200);
-    const chunk = trimChunk(remainder.slice(0, split));
-    remainder = remainder.slice(split);
-    if (chunk) chunks.push(chunk);
-  }
-
-  return { chunks, remainder };
-}
-
 // ── Extension ──────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
