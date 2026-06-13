@@ -11,10 +11,11 @@
  *   - Reasoning/thinking content is never voiced.
  *   - Interrupts cleanly on a new user turn (kills in-flight audio). It does NOT
  *     stop on agent_end — that was the upstream "cuts off mid-sentence" bug.
- *   - Manages a persistent local Kokoro server (spawned under bun, idle-unloads
- *     the model). Shared across pis; one model in memory at a time.
- *   - Keeps the /voice TUI (enable / voice / speed / model dtype / sample) and
- *     the `tts` tool.
+ *   - Manages a local Kokoro server (spawned under bun, self-exits when idle).
+ *     Shared across pis; one model in memory at a time; re-spawned on demand.
+ *   - Keeps the /voice TUI (enable / voice / speed / model dtype / sample).
+ *   - No agent-facing tool: speech is driven by the assistant's output, not a
+ *     tool the model can call (by design).
  *
  * The server is .pi/agent/voice-server/server.ts (our fork). Config lives at
  * ~/.pi/voice/config.json (shared with the server's cache dir).
@@ -26,7 +27,6 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -250,13 +250,7 @@ export default function (pi: ExtensionAPI) {
 
   // ── Serial speech queue (fetch /tts → afplay), interruptible ──────
 
-  interface SpeakItem {
-    text: string;
-    voice?: string;
-    speed?: number;
-  }
-
-  const queue: SpeakItem[] = [];
+  const queue: string[] = [];
   let running = false;
   let controller: AbortController | undefined;
   let currentChild: ChildProcess | undefined;
@@ -274,10 +268,10 @@ export default function (pi: ExtensionAPI) {
     firstFlushDone = false;
   }
 
-  function enqueueChunk(text: string, opts?: { voice?: string; speed?: number }) {
+  function enqueueChunk(text: string) {
     const cleaned = trimChunk(text);
     if (!cleaned) return;
-    queue.push({ text: cleaned, voice: opts?.voice, speed: opts?.speed });
+    queue.push(cleaned);
     void drainQueue();
   }
 
@@ -286,12 +280,12 @@ export default function (pi: ExtensionAPI) {
     running = true;
     try {
       while (queue.length > 0) {
-        const item = queue.shift();
-        if (!item) continue;
+        const text = queue.shift();
+        if (!text) continue;
         const ac = new AbortController();
         controller = ac;
         try {
-          await synthAndPlay(item, getEffective(), ac.signal);
+          await synthAndPlay(text, getEffective(), ac.signal);
         } catch (err) {
           if (!ac.signal.aborted) console.error("[voice] speak failed:", err);
         } finally {
@@ -304,15 +298,15 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  async function synthAndPlay(item: SpeakItem, config: FullVoiceConfig, signal: AbortSignal): Promise<void> {
-    const spoken = cleanTextForSpeech(item.text);
+  async function synthAndPlay(text: string, config: FullVoiceConfig, signal: AbortSignal): Promise<void> {
+    const spoken = cleanTextForSpeech(text);
     if (!spoken) return;
 
     const url = `http://${config.host}:${config.port}/tts`;
     const opts = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: spoken, voice: item.voice ?? config.voice, speed: item.speed ?? config.speed }),
+      body: JSON.stringify({ text: spoken, voice: config.voice, speed: config.speed }),
       signal,
     };
     let res: Response;
@@ -729,32 +723,6 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── tts tool ──────────────────────────────────────────────────────
-
-  pi.registerTool({
-    name: "tts",
-    label: "Text to Speech",
-    description: "Convert text to speech audio using the local Kokoro TTS server and play it.",
-    promptSnippet: "Convert text to speech and play audio",
-    promptGuidelines: ["Use tts when the user explicitly wants to hear text spoken aloud."],
-    parameters: Type.Object({
-      text: Type.String({ description: "Text to convert to speech" }),
-      voice: Type.Optional(Type.String({ description: "Voice name (defaults to configured voice)" })),
-      speed: Type.Optional(Type.Number({ description: "Speech speed 0.5-3.0", minimum: 0.5, maximum: 3.0 })),
-    }),
-    async execute(_id, params, _signal, _onUpdate, _ctx) {
-      const effective = getEffective();
-      if (!effective.enabled) {
-        return {
-          content: [{ type: "text" as const, text: "TTS is disabled. Use /voice to enable it." }],
-          details: {},
-        };
-      }
-      enqueueChunk(params.text, { voice: params.voice, speed: params.speed });
-      const preview = params.text.length > 80 ? `${params.text.slice(0, 80)}…` : params.text;
-      return { content: [{ type: "text" as const, text: `Speaking: "${preview}"` }], details: {} };
-    },
-  });
 
   // ── Status bar ──────────────────────────────────────────────────
 
