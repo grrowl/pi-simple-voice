@@ -1,24 +1,25 @@
 {
-  "name": "@s1m0n38/pi-voice",
-  "version": "2.0.1",
-  "description": "HTTP server for Kokoro TTS — text-to-speech via ONNX inference.",
+  "name": "pi-simple-voice",
+  "version": "0.1.0",
+  "description": "Streaming, verbatim Kokoro TTS for the Pi agent — speaks the assistant's output as it streams, no summarization.",
   "type": "module",
   "license": "MIT",
-  "author": "S1M0N38",
+  "author": "grrowl",
   "keywords": [
     "pi-package",
     "pi",
     "pi-coding-agent",
     "tts",
     "kokoro",
-    "speech-synthesis"
+    "speech-synthesis",
+    "streaming"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/S1M0N38/pi-voice"
+    "url": "https://github.com/grrowl/pi-simple-voice"
   },
   "bin": {
-    "pi-voice": "./src/cli.ts"
+    "pi-simple-voice": "./src/cli.ts"
   },
   "files": [
     "extensions",
@@ -37,11 +38,6 @@
     "access": "public"
   },
   "scripts": {
-    "test": "node --import jiti extensions/server.test.ts",
-    "test:tui": "bash tests/tui.sh",
-    "test:toggle": "bash tests/toggle.sh",
-    "test:queue": "bash tests/queue.sh",
-    "test:e2e": "bash tests/run.sh",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
@@ -55,15 +51,13 @@
     "kokoro-js": "^1.2.1"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.4.14",
-    "@mariozechner/pi-coding-agent": "^0.70.0",
-    "typebox": "^1.1.24",
+    "@earendil-works/pi-coding-agent": "*",
     "typescript": "^5.0.0"
   }
 }
