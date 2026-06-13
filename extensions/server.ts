@@ -44,8 +44,10 @@ function getArg(name: string, fallback: string): string {
 
 const HOST = getArg("host", "127.0.0.1");
 const PORT = Number.parseInt(getArg("port", "8181"), 10);
-// Unload the model after this many ms of no /tts. <= 0 disables idle-unload.
-const IDLE_MS = Number.parseInt(getArg("idle-ms", "300000"), 10);
+// Self-exit after this many ms of no /tts. The extension re-spawns on demand,
+// and process exit is the only thing that actually reclaims onnxruntime memory
+// (model-unload alone leaves most of it resident). <= 0 disables idle-exit.
+const IDLE_MS = Number.parseInt(getArg("idle-ms", "900000"), 10);
 const VOICE_DIR = resolve(homedir(), ".pi", "voice");
 const MANIFEST_PATH = join(VOICE_DIR, "manifest.json");
 
@@ -153,7 +155,10 @@ function makeProgressCb(dtype: DType, phase: "download" | "load") {
   };
 }
 
-// ── Idle-unload ────────────────────────────────────────────────────
+// ── Idle self-exit ──────────────────────────────────────────────────
+// Cleared while any model op (load/download/synth) is in flight; armed when the
+// server goes idle. On fire, the whole process exits — the extension re-spawns
+// on demand. This is the only reliable way to release onnxruntime memory.
 let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
 function clearIdleTimer() {
@@ -168,11 +173,10 @@ function armIdleTimer() {
   clearIdleTimer();
   idleTimer = setTimeout(() => {
     idleTimer = undefined;
-    if (loading || !tts) return;
-    console.log(`[voice-server] Idle ${IDLE_MS}ms — unloading model.`);
-    void unloadModel();
+    console.log(`[voice-server] Idle ${IDLE_MS}ms — shutting down.`);
+    process.exit(0);
   }, IDLE_MS);
-  // Don't let the idle timer keep the process alive on its own.
+  // Don't let the idle timer alone keep the process alive (the http server does).
   idleTimer.unref?.();
 }
 
@@ -212,6 +216,7 @@ async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
 
   loading = true;
   progress = { dtype, phase: "load", percent: 0 };
+  clearIdleTimer();
   try {
     await unloadModel();
 
@@ -233,6 +238,7 @@ async function loadModel(dtype: DType): Promise<import("kokoro-js").KokoroTTS> {
   } finally {
     loading = false;
     progress = null;
+    armIdleTimer();
   }
 }
 
@@ -241,6 +247,7 @@ async function downloadModel(dtype: DType): Promise<void> {
 
   console.log(`[voice-server] Downloading model: ${MODEL_ID} (dtype=${dtype}) ...`);
   progress = { dtype, phase: "download", percent: 0 };
+  clearIdleTimer();
   try {
     const { env } = await import("@huggingface/transformers");
     env.cacheDir = CACHE_DIR;
@@ -259,6 +266,7 @@ async function downloadModel(dtype: DType): Promise<void> {
     console.log(`[voice-server] Auto-activated ${dtype}.`);
   } finally {
     progress = null;
+    armIdleTimer();
   }
 }
 
@@ -267,6 +275,7 @@ async function downloadOnlyModel(dtype: DType): Promise<void> {
 
   console.log(`[voice-server] Downloading model (no activate): ${MODEL_ID} (dtype=${dtype}) ...`);
   progress = { dtype, phase: "download", percent: 0 };
+  clearIdleTimer();
   let instance: import("kokoro-js").KokoroTTS;
   try {
     const { env } = await import("@huggingface/transformers");
@@ -278,6 +287,7 @@ async function downloadOnlyModel(dtype: DType): Promise<void> {
     });
   } finally {
     progress = null;
+    armIdleTimer();
   }
   console.log(`[voice-server] Download complete (${dtype}). Disposing temporary instance...`);
   markDownloaded(dtype);
@@ -660,5 +670,7 @@ const server = createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   console.log(`[voice-server] Server listening on http://${HOST}:${PORT}`);
   console.log(`[voice-server] Cache dir: ${CACHE_DIR}`);
-  console.log(`[voice-server] Idle-unload: ${IDLE_MS > 0 ? `${IDLE_MS}ms` : "disabled"}`);
+  console.log(`[voice-server] Idle-exit: ${IDLE_MS > 0 ? `${IDLE_MS}ms` : "disabled"}`);
+  // Even an unused server exits after the idle window.
+  armIdleTimer();
 });
