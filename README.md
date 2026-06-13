@@ -43,7 +43,7 @@ Open the interactive settings UI inside Pi:
 | Speed | Speech rate (0.5×–3.0×) | ← → |
 | Model | Quantization dtype | ← → (loads on close) |
 
-Navigate with ↑ ↓, **Enter** to play a sample, **r** to reset, **Esc** to close. Toggle speech quickly with **alt+v**. The `♪` status bar shows live download/load progress (e.g. `♪ ↓ q4 25%`).
+Navigate with **↑ ↓**, change a value with **← →**, **Enter** plays a sample, **s** saves the current selection as the default, **r** resets, **Esc** closes. Toggle speech quickly with **alt+v**. The `♪` status bar shows live download/load progress (e.g. `♪ ↓ q4 25%`). The Voice row appears once a model is loaded and its voices are fetched.
 
 Settings persist in `~/.pi/voice/config.json`.
 
@@ -68,12 +68,13 @@ Settings persist in `~/.pi/voice/config.json`.
 ```bash
 pi-simple-voice server status                # show server status
 pi-simple-voice server start                 # start server, load default model
-pi-simple-voice server stop                  # stop server
+pi-simple-voice server stop                  # stop server (exits the process)
 pi-simple-voice server restart               # restart
 pi-simple-voice model list                   # list dtypes + download status
 pi-simple-voice model load <dtype>           # load (downloads if needed)
+pi-simple-voice model unload                 # unload the active model
 pi-simple-voice model download <dtype>       # download without loading
-pi-simple-voice model remove <dtype>         # delete cached files
+pi-simple-voice model remove <dtype>         # unload (if active) + delete cached files
 ```
 
 Options: `--host <host>` `--port <port>` (defaults `127.0.0.1:8181`).
@@ -96,7 +97,7 @@ The server exposes HTTP endpoints at `http://127.0.0.1:8181`:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Status, active dtype, model loaded, download/load progress |
+| GET | `/health` | Status, active + last dtype, model loaded, download/load progress |
 | GET | `/voices` | Available voice names |
 | GET | `/models` | All dtypes with download status |
 | POST | `/models/download` | Download (+ optionally activate) a dtype |

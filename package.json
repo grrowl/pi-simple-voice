@@ -23,11 +23,11 @@
   },
   "files": [
     "extensions",
+    "!extensions/*.test.ts",
     "src",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE",
-    "!.github"
+    "LICENSE"
   ],
   "pi": {
     "extensions": [

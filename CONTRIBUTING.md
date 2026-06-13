@@ -44,9 +44,6 @@ extensions/
 src/
   cli.ts               # CLI: server/model management
   prepare.js           # npm prepare hook (writes default config)
-.agents/skills/
-  pi-init/             # environment health check
-  pi-package/          # extension development patterns
 ```
 
 ## Conventions

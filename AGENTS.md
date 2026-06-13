@@ -11,7 +11,7 @@ assistant's output as it streams — no summarization, no agent-facing tool.
 | Unit tests | `bun test extensions/` |
 | Lint | `npm run lint` (biome) |
 | Type check | `npm run typecheck` |
-| Run server standalone | `npm run server` (or `bun extensions/server.ts`) |
+| Run server standalone | `bun extensions/server.ts` (or `npm run server`, which uses node+jiti) |
 | Run CLI | `bun src/cli.ts` |
 
 ## Constraints
@@ -35,7 +35,6 @@ extensions/
 src/
   cli.ts               # CLI: pi-simple-voice server/model management
   prepare.js           # npm prepare hook (writes default ~/.pi/voice/config.json)
-.agents/skills/        # pi-init, pi-package authoring skills
 ```
 
 ## Architecture
