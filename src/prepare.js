@@ -1,13 +1,14 @@
 #!/usr/bin/env node
 
 /**
- * pi-voice prepare script
+ * pi-simple-voice prepare script
  *
- * This script runs automatically when pi-voice is installed (npm install).
- * It sets up default configuration if it doesn't already exist.
+ * Runs on install (npm "prepare" lifecycle). Writes a default config if one
+ * doesn't already exist. The extension also self-heals a missing config at
+ * runtime, so this is just a convenience for first-run discoverability.
  *
- * Default: agent_end event with last_message context, using the active
- * session model for speech text generation (no summaryModel configured).
+ * This fork speaks the assistant's output verbatim and streaming — there is
+ * no summarization model and no agent_end event prompt.
  */
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
@@ -17,32 +18,20 @@ import { resolve } from "node:path";
 const CONFIG_DIR = resolve(homedir(), ".pi", "voice");
 const CONFIG_FILE = resolve(CONFIG_DIR, "config.json");
 
-const DEFAULT_SUMMARY_PROMPT =
-  "You are preparing text for a text-to-speech system. " +
-  "You will receive a message from a conversation enclosed in quadruple backticks. " +
-  "Summarize it in one single very short sentence, two at most. " +
-  "Use a dry, matter-of-fact tone. " +
-  "Do not use any markdown formatting, just plain text. " +
-  "Prefer words over symbols or abbreviations, as this will be read aloud. " +
-  "Output only the sentence, nothing else.";
-
 const DEFAULT_CONFIG = {
   enabled: true,
   voice: "af_heart",
   speed: 1.0,
   host: "127.0.0.1",
   port: 8181,
-  events: {
-    agent_end: {
-      prompt: DEFAULT_SUMMARY_PROMPT,
-    },
-  },
+  dtype: "q4",
+  idleMs: 900000,
 };
 
 function setupDefaultConfig() {
   try {
     if (existsSync(CONFIG_FILE)) {
-      console.log("pi-voice: Configuration file already exists at", CONFIG_FILE);
+      console.log("pi-simple-voice: Configuration file already exists at", CONFIG_FILE);
       return;
     }
 
@@ -50,12 +39,12 @@ function setupDefaultConfig() {
       mkdirSync(CONFIG_DIR, { recursive: true });
     }
 
-    console.log("pi-voice: Writing default configuration to", CONFIG_FILE);
+    console.log("pi-simple-voice: Writing default configuration to", CONFIG_FILE);
     writeFileSync(CONFIG_FILE, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`);
-    console.log("pi-voice: Default configuration setup complete!");
-    console.log("pi-voice: Edit", CONFIG_FILE, "to customize voice, speed, and events.");
+    console.log("pi-simple-voice: Default configuration setup complete!");
+    console.log("pi-simple-voice: Edit", CONFIG_FILE, "to customize voice, speed, and model.");
   } catch (error) {
-    console.error("pi-voice: Error setting up default configuration:", error.message);
+    console.error("pi-simple-voice: Error setting up default configuration:", error.message);
     process.exit(1);
   }
 }
