@@ -72,7 +72,7 @@ const DEFAULT_CONFIG: FullVoiceConfig = {
   host: "127.0.0.1",
   port: 8181,
   dtype: "q4",
-  idleMs: 300_000,
+  idleMs: 900_000, // 15 min idle → server self-exits; re-spawned on demand
 };
 
 function speedToIndex(speed: number): number {
@@ -308,12 +308,22 @@ export default function (pi: ExtensionAPI) {
     const spoken = cleanTextForSpeech(item.text);
     if (!spoken) return;
 
-    const res = await fetch(`http://${config.host}:${config.port}/tts`, {
+    const url = `http://${config.host}:${config.port}/tts`;
+    const opts = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text: spoken, voice: item.voice ?? config.voice, speed: item.speed ?? config.speed }),
       signal,
-    });
+    };
+    let res: Response;
+    try {
+      res = await fetch(url, opts);
+    } catch (err) {
+      // Server likely self-exited after idle — re-spawn it and retry once.
+      if (signal.aborted) throw err;
+      await ensureServer();
+      res = await fetch(url, opts);
+    }
     if (!res.ok) {
       let msg = `HTTP ${res.status}`;
       try {
