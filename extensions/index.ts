@@ -17,14 +17,15 @@
  *   - No agent-facing tool: speech is driven by the assistant's output, not a
  *     tool the model can call (by design).
  *
- * The server is .pi/agent/voice-server/server.ts (our fork). Config lives at
+ * The server is server.ts, a sibling of this file (our fork). Config lives at
  * ~/.pi/voice/config.json (shared with the server's cache dir).
  */
 
 import { type ChildProcess, exec as execCb, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
 
@@ -442,8 +443,9 @@ export default function (pi: ExtensionAPI) {
   // ── Server lifecycle (persistent + idle-unload) ───────────────────
 
   function serverScriptPath(): string {
-    const agentDir = process.env.PI_CODING_AGENT_DIR || resolve(homedir(), ".pi", "agent");
-    return resolve(agentDir, "voice-server", "server.ts");
+    // Resolve the server as a sibling of this extension file, so it works
+    // wherever the package is installed (not tied to a $PI_CODING_AGENT_DIR layout).
+    return resolve(dirname(fileURLToPath(import.meta.url)), "server.ts");
   }
 
   async function fetchHealth(): Promise<Health | null> {
