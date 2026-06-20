@@ -29,6 +29,8 @@ pi install npm:pi-simple-voice
 The extension auto-spawns the server and downloads the default `q4` model (~291 MB) the first time speech is enabled. The `pi-simple-voice` CLI is also available for manual control.
 
 > Requires [`bun`](https://bun.sh) on `PATH` — the extension spawns the server under bun.
+>
+> Audio playback uses `afplay` (macOS, built-in) or `aplay` (Linux — install `alsa-utils`). Windows is not currently supported.
 
 ## Usage
 
