@@ -48,7 +48,7 @@ interface VoiceSessionState {
   speed?: number;
 }
 
-export type VoiceSpeakSource = "tool" | "auto" | "sample";
+export type VoiceSpeakSource = "auto" | "sample";
 
 export interface VoiceConfigEvent {
   enabled: boolean;
@@ -273,7 +273,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     const wav = Buffer.from(await res.arrayBuffer());
-    const dir = join(tmpdir(), "secretary-voice");
+    const dir = join(tmpdir(), "pi-simple-voice");
     mkdirSync(dir, { recursive: true });
     const file = join(dir, `chunk-${process.pid}-${Date.now()}-${tmpSeq++}.wav`);
     writeFileSync(file, wav);
